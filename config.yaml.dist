@@ -31,9 +31,10 @@ outputs:
       addressListName: my_resolved_domains
       ttl: ~
       updateTTL: true
+      recordType: ip
   - file:
-      path: resolved-addresses.csv
-      append: true
+      path: ./data
+      addressListName: my_resolved_domains
 
 listenAddr: ":55353"
 timeout: 5s

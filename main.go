@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -49,8 +50,8 @@ type OutputConfig struct {
 }
 
 type FileOutputConfig struct {
-	Path   string `yaml:"path"`
-	Append *bool  `yaml:"append"`
+	Path            string `yaml:"path"`
+	AddressListName string `yaml:"addressListName"`
 }
 
 type DomainRule struct {
@@ -77,6 +78,11 @@ type DNSLog struct {
 	Duration  time.Duration
 }
 
+const (
+	outputFile     = "file"
+	outputRouterOS = "routeros"
+)
+
 type RouterOSConfig struct {
 	Host            string  `yaml:"host"`
 	Port            int     `yaml:"port"`
@@ -86,6 +92,7 @@ type RouterOSConfig struct {
 	AddressListName string  `yaml:"addressListName"`
 	TTL             *string `yaml:"ttl"`
 	UpdateTTL       *bool   `yaml:"updateTTL"`
+	RecordType      string  `yaml:"recordType"`
 }
 
 type Upstream struct {
@@ -100,13 +107,15 @@ type Resolver struct {
 	upstreams []Upstream
 	rules     []DomainRule
 	writers   []AddressWriter
-	listName  string
 	timeout   time.Duration
 	http      *http.Client
 }
 
 type AddressWriter interface {
 	EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error
+	DefaultListName() string
+	DefaultRecordType() string
+	OutputType() string
 }
 
 type RouterOSClient struct {
@@ -118,13 +127,12 @@ type RouterOSClient struct {
 }
 
 type FileWriter struct {
-	path   string
-	w      *bufio.Writer
-	csv    *csv.Writer
-	file   *os.File
-	cache  map[string]bool
-	append bool
-	mu     sync.Mutex
+	basePath string
+	listName string
+	writers  map[string]*csv.Writer
+	files    map[string]*os.File
+	cache    map[string]map[string]bool
+	mu       sync.Mutex
 }
 
 func main() {
@@ -161,13 +169,6 @@ func main() {
 	}
 
 	var writers []AddressWriter
-	listName := "default"
-	for _, output := range cfg.Outputs {
-		if output.RouterOS != nil && output.RouterOS.AddressListName != "" {
-			listName = output.RouterOS.AddressListName
-			break
-		}
-	}
 
 	for _, output := range cfg.Outputs {
 		if output.RouterOS != nil && output.RouterOS.Host != "" {
@@ -212,7 +213,6 @@ func main() {
 		upstreams: upstreams,
 		rules:     cfg.Domains,
 		writers:   writers,
-		listName:  listName,
 		timeout:   timeout,
 		http:      httpClient,
 	}
@@ -394,14 +394,8 @@ func (r *Resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	listName := rule.AddressListName
-	if listName == "" {
-		listName = r.listName
-	}
 
 	recordType := strings.ToLower(strings.TrimSpace(rule.RecordType))
-	if recordType == "" {
-		recordType = "ip"
-	}
 
 	domain := strings.TrimSuffix(strings.ToLower(q.Name), ".")
 
@@ -412,36 +406,55 @@ func (r *Resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			if resp == nil || resp.Rcode != dns.RcodeSuccess {
 				continue
 			}
-			switch recordType {
-			case "host":
-				hostSeen = true
+			hostSeen = true
+			for _, ip := range extractIPs(resp.Answer) {
+				ipSet[ip] = true
+			}
+		}
+		for _, writer := range r.writers {
+			effectiveList := listName
+			if effectiveList == "" {
+				effectiveList = writer.DefaultListName()
+			}
+			if effectiveList == "" {
+				continue
+			}
+
+			switch writer.OutputType() {
+			case outputFile:
+				for ip := range ipSet {
+					r.writeAddress(writer, effectiveList, domain, ip, rule.TTL, rule.UpdateTTL)
+				}
+			case outputRouterOS:
+				effectiveRecordType := recordType
+				if effectiveRecordType == "" {
+					effectiveRecordType = writer.DefaultRecordType()
+				}
+				if effectiveRecordType == "host" {
+					if hostSeen {
+						r.writeAddress(writer, effectiveList, domain, domain, rule.TTL, rule.UpdateTTL)
+					}
+				} else {
+					for ip := range ipSet {
+						r.writeAddress(writer, effectiveList, domain, ip, rule.TTL, rule.UpdateTTL)
+					}
+				}
 			default:
-				for _, ip := range extractIPs(resp.Answer) {
-					ipSet[ip] = true
+				for ip := range ipSet {
+					r.writeAddress(writer, effectiveList, domain, ip, rule.TTL, rule.UpdateTTL)
 				}
 			}
-		}
-		if recordType == "host" {
-			if hostSeen {
-				r.writeAddress(listName, domain, domain, rule.TTL, rule.UpdateTTL)
-			}
-			return
-		}
-		for ip := range ipSet {
-			r.writeAddress(listName, domain, ip, rule.TTL, rule.UpdateTTL)
 		}
 	}()
 }
 
-func (r *Resolver) writeAddress(listName, domain, address string, ttl *string, updateTTL *bool) {
-	for _, writer := range r.writers {
-		if err := writer.EnsureAddress(listName, domain, address, ttl, updateTTL); err != nil {
-			slog.Error("write address", writeAddressAttrs(DNSLog{
-				List:    listName,
-				Domain:  domain,
-				Address: address,
-			}, err)...)
-		}
+func (r *Resolver) writeAddress(writer AddressWriter, listName, domain, address string, ttl *string, updateTTL *bool) {
+	if err := writer.EnsureAddress(listName, domain, address, ttl, updateTTL); err != nil {
+		slog.Error("write address", writeAddressAttrs(DNSLog{
+			List:    listName,
+			Domain:  domain,
+			Address: address,
+		}, err)...)
 	}
 }
 
@@ -660,7 +673,7 @@ func extractIPs(records []dns.RR) []string {
 
 func (r *Resolver) matchDomain(qname string) (bool, DomainRule) {
 	if len(r.rules) == 0 {
-		return false, DomainRule{}
+		return true, DomainRule{}
 	}
 	name := strings.TrimSuffix(strings.ToLower(qname), ".")
 	labels := strings.Split(name, ".")
@@ -693,6 +706,13 @@ func (r *Resolver) matchDomain(qname string) (bool, DomainRule) {
 func NewRouterOSClient(cfg RouterOSConfig) (*RouterOSClient, error) {
 	if cfg.Host == "" {
 		return nil, errors.New("routeros host is required")
+	}
+	if strings.TrimSpace(cfg.RecordType) == "" {
+		return nil, errors.New("routeros recordType is required")
+	}
+	cfg.RecordType = strings.ToLower(strings.TrimSpace(cfg.RecordType))
+	if cfg.RecordType != "ip" && cfg.RecordType != "host" {
+		return nil, fmt.Errorf("routeros recordType must be ip or host, got %q", cfg.RecordType)
 	}
 	if cfg.AddressListName == "" {
 		return nil, errors.New("routeros addressListName is required")
@@ -734,33 +754,36 @@ func NewRouterOSClient(cfg RouterOSConfig) (*RouterOSClient, error) {
 	return client, nil
 }
 
+func (c *RouterOSClient) DefaultListName() string {
+	return c.cfg.AddressListName
+}
+
+func (c *RouterOSClient) DefaultRecordType() string {
+	return c.cfg.RecordType
+}
+
+func (c *RouterOSClient) OutputType() string {
+	return outputRouterOS
+}
+
 func NewFileWriter(cfg FileOutputConfig) (*FileWriter, error) {
-	if strings.TrimSpace(cfg.Path) == "" {
+	basePath := strings.TrimSpace(cfg.Path)
+	if basePath == "" {
 		return nil, errors.New("file output path is required")
 	}
-	appendEnabled := true
-	if cfg.Append != nil {
-		appendEnabled = *cfg.Append
+	listName := strings.TrimSpace(cfg.AddressListName)
+	if listName == "" {
+		return nil, errors.New("file output addressListName is required")
 	}
-	flags := os.O_CREATE | os.O_WRONLY
-	if appendEnabled {
-		flags |= os.O_APPEND
-	} else {
-		flags |= os.O_TRUNC
-	}
-
-	file, err := os.OpenFile(cfg.Path, flags, 0644)
-	if err != nil {
+	if err := os.MkdirAll(basePath, 0755); err != nil {
 		return nil, err
 	}
-	buf := bufio.NewWriter(file)
 	writer := &FileWriter{
-		path:   cfg.Path,
-		w:      buf,
-		csv:    csv.NewWriter(buf),
-		file:   file,
-		cache:  make(map[string]bool),
-		append: appendEnabled,
+		basePath: basePath,
+		listName: listName,
+		writers:  make(map[string]*csv.Writer),
+		files:    make(map[string]*os.File),
+		cache:    make(map[string]map[string]bool),
 	}
 	return writer, nil
 }
@@ -907,28 +930,67 @@ func (c *RouterOSClient) refreshListCache(listName string) error {
 func (f *FileWriter) EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error {
 	_ = ttl
 	_ = updateTTL
+	if listName == "" {
+		return nil
+	}
 	key := fmt.Sprintf("%s|%s", listName, address)
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if f.cache[key] {
+	if f.cache[listName] == nil {
+		f.cache[listName] = make(map[string]bool)
+	}
+	if f.cache[listName][key] {
 		return nil
 	}
 
-	if err := f.writeLine(domain); err != nil {
+	if err := f.writeLine(listName, domain, address); err != nil {
 		return err
 	}
-	f.cache[key] = true
+	f.cache[listName][key] = true
 	return nil
 }
 
-func (f *FileWriter) writeLine(domain string) error {
-	if err := f.csv.Write([]string{domain}); err != nil {
+func (f *FileWriter) DefaultListName() string {
+	return f.listName
+}
+
+func (f *FileWriter) DefaultRecordType() string {
+	return "ip"
+}
+
+func (f *FileWriter) OutputType() string {
+	return outputFile
+}
+
+func (f *FileWriter) writeLine(listName, domain, address string) error {
+	writer, err := f.getWriter(listName)
+	if err != nil {
 		return err
 	}
-	f.csv.Flush()
-	return f.csv.Error()
+	if err := writer.Write([]string{domain, address}); err != nil {
+		return err
+	}
+	writer.Flush()
+	return writer.Error()
+}
+
+func (f *FileWriter) getWriter(listName string) (*csv.Writer, error) {
+	if writer, ok := f.writers[listName]; ok {
+		return writer, nil
+	}
+	flags := os.O_CREATE | os.O_WRONLY | os.O_APPEND
+	filePath := filepath.Join(f.basePath, fmt.Sprintf("%s.csv", listName))
+	file, err := os.OpenFile(filePath, flags, 0644)
+	if err != nil {
+		return nil, err
+	}
+	buf := bufio.NewWriter(file)
+	writer := csv.NewWriter(buf)
+	f.files[listName] = file
+	f.writers[listName] = writer
+	return writer, nil
 }
 
 func shouldUpdateTTL(global *bool, override *bool) bool {
