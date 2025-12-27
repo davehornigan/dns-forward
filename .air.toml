@@ -1,0 +1,15 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/app ."
+  bin = "tmp/app"
+  include_ext = ["go", "yaml", "yml", "toml"]
+  exclude_dir = ["tmp", "vendor"]
+  delay = 1000
+  log = "air_errors.log"
+
+[run]
+  cmd = "./tmp/app -config config.yaml"
+  grace_duration = "3s"
+  kill_delay = "1s"

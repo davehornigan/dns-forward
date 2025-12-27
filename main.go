@@ -1,0 +1,942 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/csv"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-routeros/routeros"
+	"github.com/miekg/dns"
+	"gopkg.in/yaml.v3"
+	"log/slog"
+)
+
+const (
+	defaultListenAddr = ":53"
+	defaultTimeout    = 5 * time.Second
+)
+
+type Config struct {
+	Upstreams  []string       `yaml:"upstreams"`
+	Domains    []DomainRule   `yaml:"domains"`
+	Outputs    []OutputConfig `yaml:"outputs"`
+	Debug      bool           `yaml:"debug"`
+	ListenAddr string         `yaml:"listenAddr"`
+	Timeout    time.Duration  `yaml:"timeout"`
+	HTTP       HTTPConfig     `yaml:"http"`
+}
+
+type HTTPConfig struct {
+	Proxy string `yaml:"proxy"`
+}
+
+type OutputConfig struct {
+	RouterOS *RouterOSConfig   `yaml:"routerOsApi"`
+	File     *FileOutputConfig `yaml:"file"`
+}
+
+type FileOutputConfig struct {
+	Path   string `yaml:"path"`
+	Append *bool  `yaml:"append"`
+}
+
+type DomainRule struct {
+	Domain          string  `yaml:"domain"`
+	MatchSubDomains bool    `yaml:"matchSubDomains"`
+	MaxDepth        *int    `yaml:"maxDepth"`
+	TTL             *string `yaml:"ttl"`
+	RecordType      string  `yaml:"recordType"`
+	AddressListName string  `yaml:"addressListName"`
+	UpdateTTL       *bool   `yaml:"updateTTL"`
+}
+
+type DNSLog struct {
+	Qname     string
+	Qtype     string
+	Upstream  string
+	Upstreams []string
+	Rcode     string
+	Answers   int
+	Reason    string
+	List      string
+	Domain    string
+	Address   string
+	Duration  time.Duration
+}
+
+type RouterOSConfig struct {
+	Host            string  `yaml:"host"`
+	Port            int     `yaml:"port"`
+	UseTLS          bool    `yaml:"useTLS"`
+	Username        string  `yaml:"username"`
+	Password        string  `yaml:"password"`
+	AddressListName string  `yaml:"addressListName"`
+	TTL             *string `yaml:"ttl"`
+	UpdateTTL       *bool   `yaml:"updateTTL"`
+}
+
+type Upstream struct {
+	Raw      string
+	Kind     string
+	Address  string
+	URL      *url.URL
+	ServerNI string
+}
+
+type Resolver struct {
+	upstreams []Upstream
+	rules     []DomainRule
+	writers   []AddressWriter
+	listName  string
+	timeout   time.Duration
+	http      *http.Client
+}
+
+type AddressWriter interface {
+	EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error
+}
+
+type RouterOSClient struct {
+	cfg    RouterOSConfig
+	conn   *routeros.Client
+	cache  map[string]string
+	loaded map[string]bool
+	mu     sync.Mutex
+}
+
+type FileWriter struct {
+	path   string
+	w      *bufio.Writer
+	csv    *csv.Writer
+	file   *os.File
+	cache  map[string]bool
+	append bool
+	mu     sync.Mutex
+}
+
+func main() {
+	var configPath string
+	flag.StringVar(&configPath, "config", "config.yaml", "path to config YAML")
+	flag.Parse()
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		slog.Error("load config", "error", err)
+		os.Exit(1)
+	}
+	if cfg.Debug {
+		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		slog.SetDefault(logger)
+	}
+
+	upstreams, err := parseUpstreams(cfg.Upstreams)
+	if err != nil {
+		slog.Error("parse upstreams", "error", err)
+		os.Exit(1)
+	}
+	if len(upstreams) == 0 {
+		slog.Error("no upstreams configured")
+		os.Exit(1)
+	}
+
+	timeout := cfg.Timeout
+	if timeout == 0 {
+		timeout = defaultTimeout
+	}
+
+	var writers []AddressWriter
+	listName := "default"
+	for _, output := range cfg.Outputs {
+		if output.RouterOS != nil && output.RouterOS.AddressListName != "" {
+			listName = output.RouterOS.AddressListName
+			break
+		}
+	}
+
+	for _, output := range cfg.Outputs {
+		if output.RouterOS != nil && output.RouterOS.Host != "" {
+			ros, err := NewRouterOSClient(*output.RouterOS)
+			if err != nil {
+				slog.Error("routeros", "error", err)
+				os.Exit(1)
+			}
+			writers = append(writers, ros)
+		}
+
+		if output.File != nil && output.File.Path != "" {
+			fileWriter, err := NewFileWriter(*output.File)
+			if err != nil {
+				slog.Error("file writer", "error", err)
+				os.Exit(1)
+			}
+			writers = append(writers, fileWriter)
+		}
+	}
+
+	if len(writers) == 0 {
+		slog.Error("no outputs configured (outputs[].routerOsApi.host or outputs[].file.path required)")
+		os.Exit(1)
+	}
+
+	httpClient := &http.Client{
+		Timeout: timeout,
+	}
+	if cfg.HTTP.Proxy != "" {
+		proxyURL, err := url.Parse(cfg.HTTP.Proxy)
+		if err != nil {
+			slog.Error("http proxy", "error", err)
+			os.Exit(1)
+		}
+		httpClient.Transport = &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		}
+	}
+
+	resolver := &Resolver{
+		upstreams: upstreams,
+		rules:     cfg.Domains,
+		writers:   writers,
+		listName:  listName,
+		timeout:   timeout,
+		http:      httpClient,
+	}
+
+	addr := cfg.ListenAddr
+	if addr == "" {
+		addr = defaultListenAddr
+	}
+
+	slog.Info("listening", "addr", addr, "proto", "udp/tcp")
+	dns.HandleFunc(".", resolver.handleDNS)
+
+	udpSrv := &dns.Server{Addr: addr, Net: "udp"}
+	tcpSrv := &dns.Server{Addr: addr, Net: "tcp"}
+
+	go func() {
+		if err := udpSrv.ListenAndServe(); err != nil {
+			slog.Error("udp server", "error", err)
+			os.Exit(1)
+		}
+	}()
+	if err := tcpSrv.ListenAndServe(); err != nil {
+		slog.Error("tcp server", "error", err)
+		os.Exit(1)
+	}
+}
+
+func resolveErrorAttrs(entry DNSLog, err error) []any {
+	return []any{
+		"qname", entry.Qname,
+		"qtype", entry.Qtype,
+		"upstreams", entry.Upstreams,
+		"reason", entry.Reason,
+		"error", err,
+	}
+}
+
+func dnsReplyAttrs(entry DNSLog) []any {
+	return []any{
+		"qname", entry.Qname,
+		"qtype", entry.Qtype,
+		"upstream", entry.Upstream,
+		"rcode", entry.Rcode,
+		"answers", entry.Answers,
+	}
+}
+
+func upstreamResultAttrs(entry DNSLog, err error) []any {
+	if err != nil {
+		return []any{
+			"qname", entry.Qname,
+			"qtype", entry.Qtype,
+			"upstream", entry.Upstream,
+			"duration_ms", entry.Duration.Milliseconds(),
+			"error", err,
+		}
+	}
+	return []any{
+		"qname", entry.Qname,
+		"qtype", entry.Qtype,
+		"upstream", entry.Upstream,
+		"rcode", entry.Rcode,
+		"answers", entry.Answers,
+		"duration_ms", entry.Duration.Milliseconds(),
+	}
+}
+
+func writeAddressAttrs(entry DNSLog, err error) []any {
+	return []any{
+		"list", entry.List,
+		"domain", entry.Domain,
+		"address", entry.Address,
+		"error", err,
+	}
+}
+
+func loadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	for i := range cfg.Domains {
+		cfg.Domains[i].Domain = strings.TrimSuffix(strings.ToLower(cfg.Domains[i].Domain), ".")
+	}
+	return &cfg, nil
+}
+
+func parseUpstreams(raw []string) ([]Upstream, error) {
+	var upstreams []Upstream
+	for _, entry := range raw {
+		original := strings.TrimSpace(entry)
+		if original == "" {
+			continue
+		}
+		entry = original
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		u, err := url.Parse(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid upstream %q: %w", entry, err)
+		}
+		switch u.Scheme {
+		case "tls":
+			host := u.Hostname()
+			if host == "" {
+				return nil, fmt.Errorf("invalid tls upstream %q", entry)
+			}
+			port := u.Port()
+			if port == "" {
+				port = "853"
+			}
+			upstreams = append(upstreams, Upstream{
+				Raw:      original,
+				Kind:     "dot",
+				Address:  net.JoinHostPort(host, port),
+				ServerNI: host,
+			})
+		case "https":
+			if u.Hostname() == "" {
+				return nil, fmt.Errorf("invalid https upstream %q", entry)
+			}
+			if u.Path == "" {
+				return nil, fmt.Errorf("https upstream %q missing path", entry)
+			}
+			upstreams = append(upstreams, Upstream{
+				Raw:  original,
+				Kind: "doh",
+				URL:  u,
+			})
+		default:
+			return nil, fmt.Errorf("unsupported upstream scheme %q", u.Scheme)
+		}
+	}
+	return upstreams, nil
+}
+
+func (r *Resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
+	resp, firstUpstream, allCh, reason, err := r.resolveParallel(req)
+	if err != nil {
+		m := new(dns.Msg)
+		m.SetRcode(req, dns.RcodeServerFailure)
+		_ = w.WriteMsg(m)
+		qname := ""
+		qtype := ""
+		if len(req.Question) > 0 {
+			qname = req.Question[0].Name
+			qtype = dns.TypeToString[req.Question[0].Qtype]
+		}
+		slog.Error("resolve error", resolveErrorAttrs(DNSLog{
+			Qname:     qname,
+			Qtype:     qtype,
+			Upstreams: r.upstreamSummary(),
+			Reason:    reason,
+		}, err)...)
+		return
+	}
+	_ = w.WriteMsg(resp)
+
+	if len(req.Question) == 0 {
+		return
+	}
+	q := req.Question[0]
+	slog.Debug("dns reply", dnsReplyAttrs(DNSLog{
+		Qname:    q.Name,
+		Qtype:    dns.TypeToString[q.Qtype],
+		Upstream: firstUpstream,
+		Rcode:    dns.RcodeToString[resp.Rcode],
+		Answers:  len(resp.Answer),
+	})...)
+	match, rule := r.matchDomain(q.Name)
+	if !match {
+		return
+	}
+
+	listName := rule.AddressListName
+	if listName == "" {
+		listName = r.listName
+	}
+
+	recordType := strings.ToLower(strings.TrimSpace(rule.RecordType))
+	if recordType == "" {
+		recordType = "ip"
+	}
+
+	domain := strings.TrimSuffix(strings.ToLower(q.Name), ".")
+
+	go func() {
+		ipSet := make(map[string]bool)
+		hostSeen := false
+		for resp := range allCh {
+			if resp == nil || resp.Rcode != dns.RcodeSuccess {
+				continue
+			}
+			switch recordType {
+			case "host":
+				hostSeen = true
+			default:
+				for _, ip := range extractIPs(resp.Answer) {
+					ipSet[ip] = true
+				}
+			}
+		}
+		if recordType == "host" {
+			if hostSeen {
+				r.writeAddress(listName, domain, domain, rule.TTL, rule.UpdateTTL)
+			}
+			return
+		}
+		for ip := range ipSet {
+			r.writeAddress(listName, domain, ip, rule.TTL, rule.UpdateTTL)
+		}
+	}()
+}
+
+func (r *Resolver) writeAddress(listName, domain, address string, ttl *string, updateTTL *bool) {
+	for _, writer := range r.writers {
+		if err := writer.EnsureAddress(listName, domain, address, ttl, updateTTL); err != nil {
+			slog.Error("write address", writeAddressAttrs(DNSLog{
+				List:    listName,
+				Domain:  domain,
+				Address: address,
+			}, err)...)
+		}
+	}
+}
+
+func (r *Resolver) resolveParallel(req *dns.Msg) (*dns.Msg, string, <-chan *dns.Msg, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+
+	type result struct {
+		resp     *dns.Msg
+		err      error
+		upstream string
+		duration time.Duration
+	}
+
+	resCh := make(chan result, len(r.upstreams))
+
+	var wg sync.WaitGroup
+	for _, upstream := range r.upstreams {
+		upstream := upstream
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var resp *dns.Msg
+			var err error
+			qname := ""
+			qtype := ""
+			if len(req.Question) > 0 {
+				qname = req.Question[0].Name
+				qtype = dns.TypeToString[req.Question[0].Qtype]
+			}
+			start := time.Now()
+			var rtt time.Duration
+			switch upstream.Kind {
+			case "dot":
+				resp, rtt, err = exchangeDoT(ctx, upstream, req, r.timeout)
+			case "doh":
+				resp, rtt, err = exchangeDoH(ctx, r.http, upstream.URL, req)
+			default:
+				err = fmt.Errorf("unknown upstream kind %q", upstream.Kind)
+			}
+			upLabel := upstreamLabel(upstream)
+			if rtt == 0 {
+				rtt = time.Since(start)
+			}
+			resCh <- result{resp: resp, err: err, upstream: upLabel, duration: rtt}
+			if err != nil {
+				slog.Error("upstream error", upstreamResultAttrs(DNSLog{
+					Qname:    qname,
+					Qtype:    qtype,
+					Upstream: upLabel,
+					Duration: rtt,
+				}, err)...)
+				return
+			}
+			slog.Debug("upstream resolve", upstreamResultAttrs(DNSLog{
+				Qname:    qname,
+				Qtype:    qtype,
+				Upstream: upLabel,
+				Rcode:    dns.RcodeToString[resp.Rcode],
+				Answers:  len(resp.Answer),
+				Duration: rtt,
+			}, nil)...)
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(resCh)
+		cancel()
+	}()
+
+	allCh := make(chan *dns.Msg, len(r.upstreams))
+	firstCh := make(chan result, 1)
+	reasonCh := make(chan string, 1)
+
+	go func() {
+		firstSent := false
+		errs := make([]string, 0, len(r.upstreams))
+		for res := range resCh {
+			if res.err != nil {
+				errs = append(errs, res.err.Error())
+				continue
+			}
+			allCh <- res.resp
+			if !firstSent {
+				firstSent = true
+				firstCh <- res
+			}
+		}
+		if !firstSent {
+			if len(errs) > 0 {
+				reasonCh <- strings.Join(errs, "; ")
+			} else {
+				reasonCh <- "all upstreams failed"
+			}
+		}
+		close(allCh)
+		close(firstCh)
+		close(reasonCh)
+	}()
+
+	select {
+	case res, ok := <-firstCh:
+		if ok {
+			return res.resp, res.upstream, allCh, "", nil
+		}
+		reason := "all upstreams failed"
+		if msg, ok := <-reasonCh; ok && msg != "" {
+			reason = msg
+		}
+		return nil, "", allCh, reason, errors.New("all upstreams failed")
+	case <-ctx.Done():
+		return nil, "", allCh, "timeout", ctx.Err()
+	case reason, ok := <-reasonCh:
+		if ok && reason != "" {
+			return nil, "", allCh, reason, errors.New("all upstreams failed")
+		}
+		return nil, "", allCh, "all upstreams failed", errors.New("all upstreams failed")
+	}
+}
+
+func (r *Resolver) upstreamSummary() []string {
+	out := make([]string, 0, len(r.upstreams))
+	for _, upstream := range r.upstreams {
+		out = append(out, upstreamLabel(upstream))
+	}
+	return out
+}
+
+func upstreamLabel(upstream Upstream) string {
+	if upstream.Raw != "" {
+		return upstream.Raw
+	}
+	switch upstream.Kind {
+	case "dot":
+		return upstream.Address
+	case "doh":
+		if upstream.URL != nil {
+			return upstream.URL.String()
+		}
+		return "<nil>"
+	default:
+		return fmt.Sprintf("unknown:%s", upstream.Kind)
+	}
+}
+
+func exchangeDoT(ctx context.Context, upstream Upstream, req *dns.Msg, timeout time.Duration) (*dns.Msg, time.Duration, error) {
+	client := &dns.Client{
+		Net: "tcp-tls",
+		TLSConfig: &tls.Config{
+			ServerName: upstream.ServerNI,
+		},
+		Timeout: timeout,
+	}
+	return client.ExchangeContext(ctx, req, upstream.Address)
+}
+
+func exchangeDoH(ctx context.Context, client *http.Client, endpoint *url.URL, req *dns.Msg) (*dns.Msg, time.Duration, error) {
+	wire, err := req.Pack()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(wire))
+	if err != nil {
+		return nil, 0, err
+	}
+	httpReq.Header.Set("Content-Type", "application/dns-message")
+	httpReq.Header.Set("Accept", "application/dns-message")
+
+	start := time.Now()
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, 0, fmt.Errorf("doh status %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	msg := new(dns.Msg)
+	if err := msg.Unpack(payload); err != nil {
+		return nil, 0, err
+	}
+
+	return msg, time.Since(start), nil
+}
+
+func extractIPs(records []dns.RR) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, rr := range records {
+		switch v := rr.(type) {
+		case *dns.A:
+			ip := v.A.String()
+			if !seen[ip] {
+				seen[ip] = true
+				out = append(out, ip)
+			}
+		case *dns.AAAA:
+			ip := v.AAAA.String()
+			if !seen[ip] {
+				seen[ip] = true
+				out = append(out, ip)
+			}
+		}
+	}
+	return out
+}
+
+func (r *Resolver) matchDomain(qname string) (bool, DomainRule) {
+	if len(r.rules) == 0 {
+		return false, DomainRule{}
+	}
+	name := strings.TrimSuffix(strings.ToLower(qname), ".")
+	labels := strings.Split(name, ".")
+
+	for _, rule := range r.rules {
+		if rule.Domain == "" {
+			continue
+		}
+		domain := rule.Domain
+		if name == domain {
+			return true, rule
+		}
+		if !rule.MatchSubDomains {
+			continue
+		}
+		if strings.HasSuffix(name, "."+domain) {
+			if rule.MaxDepth == nil {
+				return true, rule
+			}
+			domainLabels := strings.Split(domain, ".")
+			depth := len(labels) - len(domainLabels)
+			if depth <= *rule.MaxDepth {
+				return true, rule
+			}
+		}
+	}
+	return false, DomainRule{}
+}
+
+func NewRouterOSClient(cfg RouterOSConfig) (*RouterOSClient, error) {
+	if cfg.Host == "" {
+		return nil, errors.New("routeros host is required")
+	}
+	if cfg.AddressListName == "" {
+		return nil, errors.New("routeros addressListName is required")
+	}
+	if cfg.Username == "" {
+		cfg.Username = os.Getenv("ROUTEROS_USER")
+	}
+	if cfg.Password == "" {
+		cfg.Password = os.Getenv("ROUTEROS_PASS")
+	}
+	if cfg.Username == "" || cfg.Password == "" {
+		return nil, errors.New("routeros credentials are required (username/password or env ROUTEROS_USER/ROUTEROS_PASS)")
+	}
+
+	address := formatRouterOSAddress(cfg)
+
+	var (
+		conn *routeros.Client
+		err  error
+	)
+	if cfg.UseTLS {
+		conn, err = routeros.DialTLS(address, cfg.Username, cfg.Password, &tls.Config{})
+	} else {
+		conn, err = routeros.Dial(address, cfg.Username, cfg.Password)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	client := &RouterOSClient{
+		cfg:    cfg,
+		conn:   conn,
+		cache:  make(map[string]string),
+		loaded: make(map[string]bool),
+	}
+	if err := client.ensureListCache(cfg.AddressListName); err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func NewFileWriter(cfg FileOutputConfig) (*FileWriter, error) {
+	if strings.TrimSpace(cfg.Path) == "" {
+		return nil, errors.New("file output path is required")
+	}
+	appendEnabled := true
+	if cfg.Append != nil {
+		appendEnabled = *cfg.Append
+	}
+	flags := os.O_CREATE | os.O_WRONLY
+	if appendEnabled {
+		flags |= os.O_APPEND
+	} else {
+		flags |= os.O_TRUNC
+	}
+
+	file, err := os.OpenFile(cfg.Path, flags, 0644)
+	if err != nil {
+		return nil, err
+	}
+	buf := bufio.NewWriter(file)
+	writer := &FileWriter{
+		path:   cfg.Path,
+		w:      buf,
+		csv:    csv.NewWriter(buf),
+		file:   file,
+		cache:  make(map[string]bool),
+		append: appendEnabled,
+	}
+	return writer, nil
+}
+
+func formatRouterOSAddress(cfg RouterOSConfig) string {
+	port := cfg.Port
+	if port == 0 {
+		if cfg.UseTLS {
+			port = 8729
+		} else {
+			port = 8728
+		}
+	}
+	return net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", port))
+}
+
+func (c *RouterOSClient) ensureListCache(listName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.loaded[listName] {
+		return nil
+	}
+
+	reply, err := c.conn.Run("/ip/firewall/address-list/print", fmt.Sprintf("?list=%s", listName))
+	if err != nil {
+		lower := strings.ToLower(err.Error())
+		// If the list is not present yet, allow runtime population on first add.
+		if strings.Contains(lower, "no such item") {
+			c.loaded[listName] = true
+			return nil
+		}
+		// RouterOS can return !empty for an empty list; ignore and let runtime populate.
+		if strings.Contains(lower, "routeros reply word: !empty") {
+			c.loaded[listName] = true
+			return nil
+		}
+		return err
+	}
+	for _, re := range reply.Re {
+		id := re.Map[".id"]
+		address := re.Map["address"]
+		if address != "" && id != "" {
+			key := fmt.Sprintf("%s|%s", listName, address)
+			c.cache[key] = id
+		}
+	}
+	c.loaded[listName] = true
+	return nil
+}
+
+func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error {
+	if err := c.ensureListCache(listName); err != nil {
+		return err
+	}
+
+	key := fmt.Sprintf("%s|%s", listName, address)
+	effectiveTTL := ""
+	if ttl != nil && strings.TrimSpace(*ttl) != "" {
+		effectiveTTL = strings.TrimSpace(*ttl)
+	} else if c.cfg.TTL != nil && strings.TrimSpace(*c.cfg.TTL) != "" {
+		effectiveTTL = strings.TrimSpace(*c.cfg.TTL)
+	}
+
+	c.mu.Lock()
+	if id, ok := c.cache[key]; ok && id != "" {
+		c.mu.Unlock()
+		if effectiveTTL == "" || !shouldUpdateTTL(c.cfg.UpdateTTL, updateTTL) {
+			return nil
+		}
+		return c.updateAddressTTL(id, effectiveTTL)
+	} else if ok && id == "" {
+		c.mu.Unlock()
+		if err := c.refreshListCache(listName); err != nil {
+			return err
+		}
+		if effectiveTTL == "" || !shouldUpdateTTL(c.cfg.UpdateTTL, updateTTL) {
+			return nil
+		}
+		c.mu.Lock()
+		id = c.cache[key]
+		c.mu.Unlock()
+		if id != "" {
+			return c.updateAddressTTL(id, effectiveTTL)
+		}
+		return nil
+	}
+	c.mu.Unlock()
+
+	args := []string{
+		"/ip/firewall/address-list/add",
+		fmt.Sprintf("=list=%s", listName),
+		fmt.Sprintf("=address=%s", address),
+		fmt.Sprintf("=comment=%s", domain),
+	}
+	if effectiveTTL != "" {
+		args = append(args, fmt.Sprintf("=timeout=%s", effectiveTTL))
+	}
+
+	c.mu.Lock()
+	if _, ok := c.cache[key]; ok {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	reply, err := c.conn.RunArgs(args)
+	if err != nil {
+		return err
+	}
+	if len(reply.Re) > 0 {
+		if id := reply.Re[0].Map[".id"]; id != "" {
+			c.mu.Lock()
+			c.cache[key] = id
+			c.mu.Unlock()
+			return nil
+		}
+	}
+	// Fallback: refresh cache if add response doesn't include .id.
+	if err := c.refreshListCache(listName); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *RouterOSClient) updateAddressTTL(id, ttl string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, err := c.conn.RunArgs([]string{
+		"/ip/firewall/address-list/set",
+		fmt.Sprintf("=.id=%s", id),
+		fmt.Sprintf("=timeout=%s", ttl),
+	})
+	return err
+}
+
+func (c *RouterOSClient) refreshListCache(listName string) error {
+	c.mu.Lock()
+	c.loaded[listName] = false
+	c.mu.Unlock()
+	return c.ensureListCache(listName)
+}
+
+func (f *FileWriter) EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error {
+	_ = ttl
+	_ = updateTTL
+	key := fmt.Sprintf("%s|%s", listName, address)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.cache[key] {
+		return nil
+	}
+
+	if err := f.writeLine(domain); err != nil {
+		return err
+	}
+	f.cache[key] = true
+	return nil
+}
+
+func (f *FileWriter) writeLine(domain string) error {
+	if err := f.csv.Write([]string{domain}); err != nil {
+		return err
+	}
+	f.csv.Flush()
+	return f.csv.Error()
+}
+
+func shouldUpdateTTL(global *bool, override *bool) bool {
+	if override != nil {
+		return *override
+	}
+	if global == nil {
+		return true
+	}
+	return *global
+}
