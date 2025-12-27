@@ -69,7 +69,7 @@ make air
 Run the published image from GHCR:
 
 ```bash
-docker run --rm -p 5353:5353/udp -p 5353:5353/tcp ghcr.io/davehornigan/dns-forward:latest
+docker run --rm -p 55353:55353/udp -p 55353:55353/tcp ghcr.io/davehornigan/dns-forward:latest
 ```
 
 ## License
