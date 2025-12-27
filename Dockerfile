@@ -2,17 +2,14 @@ ARG GOLANG_VERSION=1.25
 
 FROM golang:${GOLANG_VERSION}-alpine
 
-RUN apk add --no-cache git
-
 WORKDIR /app
 
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
-
-RUN go install github.com/air-verse/air@latest
 
 COPY . .
 
-EXPOSE 53/udp 53/tcp
+RUN go build -o /usr/local/bin/dns-forward main.go && chmod +x /usr/local/bin/dns-forward
 
-CMD ["air", "-c", ".air.toml"]
+ENTRYPOINT ["/usr/local/bin/dns-forward"]
+CMD ["-config", "config.yaml"]
