@@ -66,9 +66,10 @@ make air
 ```
 
 ## Docker
+Run the published image from GHCR:
+
 ```bash
-docker build --build-arg GOLANG_VERSION=1.25 -t dns-forward .
-docker run --rm -p 5353:5353/udp -p 5353:5353/tcp dns-forward
+docker run --rm -p 5353:5353/udp -p 5353:5353/tcp ghcr.io/davehornigan/dns-forward:latest
 ```
 
 ## License
