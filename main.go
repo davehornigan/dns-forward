@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,16 +29,18 @@ import (
 const (
 	defaultListenAddr = ":53"
 	defaultTimeout    = 5 * time.Second
+	defaultRouterOSCacheRefresh = 5 * time.Minute
 )
 
 type Config struct {
-	Upstreams  []string       `yaml:"upstreams"`
-	Domains    []DomainRule   `yaml:"domains"`
-	Outputs    []OutputConfig `yaml:"outputs"`
-	Debug      bool           `yaml:"debug"`
-	ListenAddr string         `yaml:"listenAddr"`
-	Timeout    time.Duration  `yaml:"timeout"`
-	HTTP       HTTPConfig     `yaml:"http"`
+	Upstreams         []string       `yaml:"upstreams"`
+	FallbackUpstreams []string       `yaml:"fallbackUpstreams"`
+	Domains           []DomainRule   `yaml:"domains"`
+	Outputs           []OutputConfig `yaml:"outputs"`
+	Debug             bool           `yaml:"debug"`
+	ListenAddr        string         `yaml:"listenAddr"`
+	Timeout           time.Duration  `yaml:"timeout"`
+	HTTP              HTTPConfig     `yaml:"http"`
 }
 
 type HTTPConfig struct {
@@ -104,11 +107,14 @@ type Upstream struct {
 }
 
 type Resolver struct {
-	upstreams []Upstream
-	rules     []DomainRule
-	writers   []AddressWriter
-	timeout   time.Duration
-	http      *http.Client
+	upstreams         []Upstream
+	fallbackUpstreams []Upstream
+	rules             []DomainRule
+	writers           []AddressWriter
+	timeout           time.Duration
+	http              *http.Client
+	fallbackCache     map[string]cachedResponse
+	fallbackMu        sync.Mutex
 }
 
 type AddressWriter interface {
@@ -133,6 +139,11 @@ type FileWriter struct {
 	files    map[string]*os.File
 	cache    map[string]map[string]bool
 	mu       sync.Mutex
+}
+
+type cachedResponse struct {
+	resp      *dns.Msg
+	expiresAt time.Time
 }
 
 func main() {
@@ -161,6 +172,19 @@ func main() {
 	if len(upstreams) == 0 {
 		slog.Error("no upstreams configured")
 		os.Exit(1)
+	}
+
+	fallbackUpstreams, err := parseUpstreams(cfg.FallbackUpstreams)
+	if err != nil {
+		slog.Error("parse fallback upstreams", "error", err)
+		os.Exit(1)
+	}
+	if len(fallbackUpstreams) == 0 {
+		fallbackUpstreams, err = parseUpstreams([]string{"udp://1.1.1.1:53"})
+		if err != nil {
+			slog.Error("parse fallback upstreams", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	timeout := cfg.Timeout
@@ -195,6 +219,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	outputSummaries := make([]string, 0, len(cfg.Outputs))
+	for _, output := range cfg.Outputs {
+		if output.RouterOS != nil && output.RouterOS.Host != "" {
+			address := formatRouterOSAddress(*output.RouterOS)
+			outputSummaries = append(outputSummaries, "routeros:"+address)
+		}
+		if output.File != nil && output.File.Path != "" {
+			outputSummaries = append(outputSummaries, "file:"+output.File.Path)
+		}
+	}
+
+	fallbackLabels := make([]string, 0, len(fallbackUpstreams))
+	for _, upstream := range fallbackUpstreams {
+		fallbackLabels = append(fallbackLabels, upstreamLabel(upstream))
+	}
+
+	slog.Info("config",
+		"upstreams", upstreamLabels(upstreams),
+		"fallback_upstreams", fallbackLabels,
+		"outputs", outputSummaries,
+	)
+
 	httpClient := &http.Client{
 		Timeout: timeout,
 	}
@@ -210,11 +256,13 @@ func main() {
 	}
 
 	resolver := &Resolver{
-		upstreams: upstreams,
-		rules:     cfg.Domains,
-		writers:   writers,
-		timeout:   timeout,
-		http:      httpClient,
+		upstreams:         upstreams,
+		fallbackUpstreams: fallbackUpstreams,
+		rules:             cfg.Domains,
+		writers:           writers,
+		timeout:           timeout,
+		http:              httpClient,
+		fallbackCache:     make(map[string]cachedResponse),
 	}
 
 	addr := cfg.ListenAddr
@@ -316,6 +364,18 @@ func parseUpstreams(raw []string) ([]Upstream, error) {
 		if entry == "" {
 			continue
 		}
+		if !strings.Contains(entry, "://") {
+			host, port, err := parseHostPortDefault(entry, "53")
+			if err != nil {
+				return nil, fmt.Errorf("invalid udp upstream %q: %w", entry, err)
+			}
+			upstreams = append(upstreams, Upstream{
+				Raw:     original,
+				Kind:    "udp",
+				Address: net.JoinHostPort(host, port),
+			})
+			continue
+		}
 		u, err := url.Parse(entry)
 		if err != nil {
 			return nil, fmt.Errorf("invalid upstream %q: %w", entry, err)
@@ -336,6 +396,20 @@ func parseUpstreams(raw []string) ([]Upstream, error) {
 				Address:  net.JoinHostPort(host, port),
 				ServerNI: host,
 			})
+		case "udp", "tcp":
+			host := u.Hostname()
+			if host == "" {
+				return nil, fmt.Errorf("invalid %s upstream %q", u.Scheme, entry)
+			}
+			port := u.Port()
+			if port == "" {
+				port = "53"
+			}
+			upstreams = append(upstreams, Upstream{
+				Raw:     original,
+				Kind:    u.Scheme,
+				Address: net.JoinHostPort(host, port),
+			})
 		case "https":
 			if u.Hostname() == "" {
 				return nil, fmt.Errorf("invalid https upstream %q", entry)
@@ -353,6 +427,56 @@ func parseUpstreams(raw []string) ([]Upstream, error) {
 		}
 	}
 	return upstreams, nil
+}
+
+func parseHostPortDefault(input, defaultPort string) (string, string, error) {
+	entry := strings.TrimSpace(input)
+	if entry == "" {
+		return "", "", errors.New("empty host")
+	}
+	if strings.HasPrefix(entry, "[") {
+		if strings.Contains(entry, "]:") {
+			host, port, err := net.SplitHostPort(entry)
+			if err != nil {
+				return "", "", err
+			}
+			return host, port, nil
+		}
+		if strings.HasSuffix(entry, "]") {
+			host := strings.TrimSuffix(strings.TrimPrefix(entry, "["), "]")
+			if host == "" {
+				return "", "", errors.New("empty host")
+			}
+			return host, defaultPort, nil
+		}
+		return "", "", errors.New("invalid bracketed host")
+	}
+
+	colons := strings.Count(entry, ":")
+	switch colons {
+	case 0:
+		return entry, defaultPort, nil
+	case 1:
+		host, port, err := net.SplitHostPort(entry)
+		if err == nil {
+			return host, port, nil
+		}
+		idx := strings.LastIndex(entry, ":")
+		if idx <= 0 || idx >= len(entry)-1 {
+			return "", "", errors.New("invalid host:port")
+		}
+		host = entry[:idx]
+		port = entry[idx+1:]
+		if _, err := strconv.Atoi(port); err != nil {
+			return "", "", fmt.Errorf("invalid port %q", port)
+		}
+		return host, port, nil
+	default:
+		if ip := net.ParseIP(entry); ip != nil {
+			return entry, defaultPort, nil
+		}
+		return "", "", errors.New("invalid host")
+	}
 }
 
 func (r *Resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
@@ -459,6 +583,27 @@ func (r *Resolver) writeAddress(writer AddressWriter, listName, domain, address 
 }
 
 func (r *Resolver) resolveParallel(req *dns.Msg) (*dns.Msg, string, <-chan *dns.Msg, string, error) {
+	resp, upstream, allCh, reason, ok := r.resolvePrimary(req)
+	if ok {
+		return resp, upstream, allCh, "", nil
+	}
+	if len(r.fallbackUpstreams) == 0 {
+		return nil, "", allCh, reason, errors.New("all upstreams failed")
+	}
+	fbResp, fbUpstream, fbReason, err := r.resolveFallback(req)
+	if err != nil {
+		combined := reason
+		if combined == "" {
+			combined = fbReason
+		} else if fbReason != "" {
+			combined = combined + "; fallback: " + fbReason
+		}
+		return nil, "", allCh, combined, err
+	}
+	return fbResp, fbUpstream, allCh, "", nil
+}
+
+func (r *Resolver) resolvePrimary(req *dns.Msg) (*dns.Msg, string, <-chan *dns.Msg, string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
 
 	type result struct {
@@ -487,6 +632,8 @@ func (r *Resolver) resolveParallel(req *dns.Msg) (*dns.Msg, string, <-chan *dns.
 			start := time.Now()
 			var rtt time.Duration
 			switch upstream.Kind {
+			case "udp", "tcp":
+				resp, rtt, err = exchangeDNS(ctx, upstream.Kind, upstream.Address, req, r.timeout)
 			case "dot":
 				resp, rtt, err = exchangeDoT(ctx, upstream, req, r.timeout)
 			case "doh":
@@ -529,23 +676,39 @@ func (r *Resolver) resolveParallel(req *dns.Msg) (*dns.Msg, string, <-chan *dns.
 	firstCh := make(chan result, 1)
 	reasonCh := make(chan string, 1)
 
+	qtype := uint16(0)
+	if len(req.Question) > 0 {
+		qtype = req.Question[0].Qtype
+	}
+
 	go func() {
 		firstSent := false
 		errs := make([]string, 0, len(r.upstreams))
+		normalSeen := false
 		for res := range resCh {
 			if res.err != nil {
 				errs = append(errs, res.err.Error())
 				continue
 			}
 			allCh <- res.resp
-			if !firstSent {
+			hasAddress := responseHasAddress(res.resp, qtype)
+			if hasAddress {
+				normalSeen = true
+			}
+			if !firstSent && hasAddress {
 				firstSent = true
 				firstCh <- res
 			}
 		}
 		if !firstSent {
-			if len(errs) > 0 {
+			if len(errs) == len(r.upstreams) && len(errs) > 0 {
 				reasonCh <- strings.Join(errs, "; ")
+			} else if !normalSeen {
+				reason := "no primary upstream returned address"
+				if len(errs) > 0 {
+					reason += "; errors: " + strings.Join(errs, "; ")
+				}
+				reasonCh <- reason
 			} else {
 				reasonCh <- "all upstreams failed"
 			}
@@ -558,21 +721,109 @@ func (r *Resolver) resolveParallel(req *dns.Msg) (*dns.Msg, string, <-chan *dns.
 	select {
 	case res, ok := <-firstCh:
 		if ok {
-			return res.resp, res.upstream, allCh, "", nil
+			return res.resp, res.upstream, allCh, "", true
 		}
 		reason := "all upstreams failed"
 		if msg, ok := <-reasonCh; ok && msg != "" {
 			reason = msg
 		}
-		return nil, "", allCh, reason, errors.New("all upstreams failed")
+		return nil, "", allCh, reason, false
 	case <-ctx.Done():
-		return nil, "", allCh, "timeout", ctx.Err()
+		return nil, "", allCh, "timeout", false
 	case reason, ok := <-reasonCh:
 		if ok && reason != "" {
-			return nil, "", allCh, reason, errors.New("all upstreams failed")
+			return nil, "", allCh, reason, false
 		}
-		return nil, "", allCh, "all upstreams failed", errors.New("all upstreams failed")
+		return nil, "", allCh, "all upstreams failed", false
 	}
+}
+
+func (r *Resolver) resolveFallback(req *dns.Msg) (*dns.Msg, string, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+	defer cancel()
+
+	if cached, ok := r.fallbackCacheGet(req); ok {
+		return cached, "fallback:cache", "", nil
+	}
+
+	type result struct {
+		resp     *dns.Msg
+		err      error
+		upstream string
+		duration time.Duration
+	}
+
+	resCh := make(chan result, len(r.fallbackUpstreams))
+	var wg sync.WaitGroup
+	for _, upstream := range r.fallbackUpstreams {
+		upstream := upstream
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var resp *dns.Msg
+			var err error
+			qname := ""
+			qtype := ""
+			if len(req.Question) > 0 {
+				qname = req.Question[0].Name
+				qtype = dns.TypeToString[req.Question[0].Qtype]
+			}
+			start := time.Now()
+			var rtt time.Duration
+			switch upstream.Kind {
+			case "udp", "tcp":
+				resp, rtt, err = exchangeDNS(ctx, upstream.Kind, upstream.Address, req, r.timeout)
+			case "dot":
+				resp, rtt, err = exchangeDoT(ctx, upstream, req, r.timeout)
+			case "doh":
+				resp, rtt, err = exchangeDoH(ctx, r.http, upstream.URL, req)
+			default:
+				err = fmt.Errorf("unknown upstream kind %q", upstream.Kind)
+			}
+			upLabel := "fallback:" + upstreamLabel(upstream)
+			if rtt == 0 {
+				rtt = time.Since(start)
+			}
+			resCh <- result{resp: resp, err: err, upstream: upLabel, duration: rtt}
+			if err != nil {
+				slog.Error("upstream error", upstreamResultAttrs(DNSLog{
+					Qname:    qname,
+					Qtype:    qtype,
+					Upstream: upLabel,
+					Duration: rtt,
+				}, err)...)
+				return
+			}
+			slog.Debug("upstream resolve", upstreamResultAttrs(DNSLog{
+				Qname:    qname,
+				Qtype:    qtype,
+				Upstream: upLabel,
+				Rcode:    dns.RcodeToString[resp.Rcode],
+				Answers:  len(resp.Answer),
+				Duration: rtt,
+			}, nil)...)
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(resCh)
+	}()
+
+	errs := make([]string, 0, len(r.fallbackUpstreams))
+	for res := range resCh {
+		if res.err != nil {
+			errs = append(errs, res.err.Error())
+			continue
+		}
+		r.fallbackCacheSet(req, res.resp)
+		return res.resp, res.upstream, "", nil
+	}
+	reason := "all fallback upstreams failed"
+	if len(errs) > 0 {
+		reason = strings.Join(errs, "; ")
+	}
+	return nil, "", reason, errors.New("all fallback upstreams failed")
 }
 
 func (r *Resolver) upstreamSummary() []string {
@@ -583,11 +834,90 @@ func (r *Resolver) upstreamSummary() []string {
 	return out
 }
 
+func upstreamLabels(upstreams []Upstream) []string {
+	out := make([]string, 0, len(upstreams))
+	for _, upstream := range upstreams {
+		out = append(out, upstreamLabel(upstream))
+	}
+	return out
+}
+
+func fallbackCacheKey(q dns.Question) string {
+	return strings.ToLower(q.Name) + "|" + dns.TypeToString[q.Qtype] + "|" + dns.ClassToString[q.Qclass]
+}
+
+func minAnswerTTL(resp *dns.Msg) uint32 {
+	if resp == nil || len(resp.Answer) == 0 {
+		return 0
+	}
+	minTTL := resp.Answer[0].Header().Ttl
+	for _, rr := range resp.Answer[1:] {
+		if ttl := rr.Header().Ttl; ttl < minTTL {
+			minTTL = ttl
+		}
+	}
+	return minTTL
+}
+
+func (r *Resolver) fallbackCacheGet(req *dns.Msg) (*dns.Msg, bool) {
+	if len(req.Question) == 0 {
+		return nil, false
+	}
+	key := fallbackCacheKey(req.Question[0])
+
+	r.fallbackMu.Lock()
+	entry, ok := r.fallbackCache[key]
+	if !ok {
+		r.fallbackMu.Unlock()
+		return nil, false
+	}
+	if time.Now().After(entry.expiresAt) {
+		delete(r.fallbackCache, key)
+		r.fallbackMu.Unlock()
+		return nil, false
+	}
+	remaining := entry.expiresAt.Sub(time.Now())
+	r.fallbackMu.Unlock()
+
+	resp := entry.resp.Copy()
+	resp.Id = req.Id
+	resp.Compress = req.Compress
+
+	remainingSec := uint32(remaining / time.Second)
+	for _, rr := range resp.Answer {
+		if rr.Header().Ttl > remainingSec {
+			rr.Header().Ttl = remainingSec
+		}
+	}
+	return resp, true
+}
+
+func (r *Resolver) fallbackCacheSet(req *dns.Msg, resp *dns.Msg) {
+	if len(req.Question) == 0 || resp == nil {
+		return
+	}
+	ttl := minAnswerTTL(resp)
+	if ttl == 0 {
+		return
+	}
+	key := fallbackCacheKey(req.Question[0])
+	expiry := time.Now().Add(time.Duration(ttl) * time.Second)
+
+	r.fallbackMu.Lock()
+	r.fallbackCache[key] = cachedResponse{
+		resp:      resp.Copy(),
+		expiresAt: expiry,
+	}
+	r.fallbackMu.Unlock()
+}
+
 func upstreamLabel(upstream Upstream) string {
 	if upstream.Raw != "" {
 		return upstream.Raw
 	}
 	switch upstream.Kind {
+	case "udp", "tcp":
+		return upstream.Address
 	case "dot":
 		return upstream.Address
 	case "doh":
@@ -609,6 +939,14 @@ func exchangeDoT(ctx context.Context, upstream Upstream, req *dns.Msg, timeout t
 		Timeout: timeout,
 	}
 	return client.ExchangeContext(ctx, req, upstream.Address)
+}
+
+func exchangeDNS(ctx context.Context, network, address string, req *dns.Msg, timeout time.Duration) (*dns.Msg, time.Duration, error) {
+	client := &dns.Client{
+		Net:     network,
+		Timeout: timeout,
+	}
+	return client.ExchangeContext(ctx, req, address)
 }
 
 func exchangeDoH(ctx context.Context, client *http.Client, endpoint *url.URL, req *dns.Msg) (*dns.Msg, time.Duration, error) {
@@ -669,6 +1007,29 @@ func extractIPs(records []dns.RR) []string {
 		}
 	}
 	return out
+}
+
+func hasAnswerType(records []dns.RR, qtype uint16) bool {
+	for _, rr := range records {
+		if rr.Header().Rrtype == qtype {
+			return true
+		}
+	}
+	return false
+}
+
+func responseHasAddress(resp *dns.Msg, qtype uint16) bool {
+	if resp == nil || resp.Rcode != dns.RcodeSuccess {
+		return false
+	}
+	switch qtype {
+	case dns.TypeA, dns.TypeAAAA:
+		return hasAnswerType(resp.Answer, qtype)
+	case dns.TypeANY:
+		return len(extractIPs(resp.Answer)) > 0
+	default:
+		return true
+	}
 }
 
 func (r *Resolver) matchDomain(qname string) (bool, DomainRule) {
@@ -751,6 +1112,7 @@ func NewRouterOSClient(cfg RouterOSConfig) (*RouterOSClient, error) {
 	if err := client.ensureListCache(cfg.AddressListName); err != nil {
 		return nil, err
 	}
+	client.startCacheRefresher(defaultRouterOSCacheRefresh)
 	return client, nil
 }
 
@@ -925,6 +1287,36 @@ func (c *RouterOSClient) refreshListCache(listName string) error {
 	c.loaded[listName] = false
 	c.mu.Unlock()
 	return c.ensureListCache(listName)
+}
+
+func (c *RouterOSClient) refreshAllLists() {
+	c.mu.Lock()
+	listNames := make([]string, 0, len(c.loaded))
+	for listName, loaded := range c.loaded {
+		if loaded {
+			listNames = append(listNames, listName)
+		}
+	}
+	c.mu.Unlock()
+
+	for _, listName := range listNames {
+		if err := c.refreshListCache(listName); err != nil {
+			slog.Error("routeros refresh list cache", "list", listName, "error", err)
+		}
+	}
+}
+
+func (c *RouterOSClient) startCacheRefresher(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			c.refreshAllLists()
+		}
+	}()
 }
 
 func (f *FileWriter) EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error {

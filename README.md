@@ -16,8 +16,12 @@ Copy `config.yaml.dist` to `config.yaml` and edit:
 
 ```yaml
 upstreams:
+  - udp://1.1.1.1
   - tls://dns.google
   - https://dns.google/query
+fallbackUpstreams:
+  - tls://dns.quad9.net
+  - https://dns.quad9.net/dns-query
 
 domains:
   - domain: google.com
@@ -53,6 +57,9 @@ debug: false
 
 Notes:
 - DoH upstreams require a full path (e.g. `https://dns.google/query`).
+- UDP/TCP upstreams use `udp://` or `tcp://` and default to port 53.
+- Bare `host` or `host:port` entries default to UDP.
+- `fallbackUpstreams` are only used when no primary upstream returns an address, and their answers are not written to address lists. If omitted, defaults to `udp://1.1.1.1:53`.
 - `recordType: host` writes the domain itself into the address-list.
 - File output writes a CSV with two columns: `domain`, `ip`. The file name is
   `<path>/<addressListName>.csv`, derived from the effective list for each domain.

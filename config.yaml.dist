@@ -3,6 +3,10 @@ upstreams:
   - https://dns.google/dns-query
   - tls://one.one.one.one
   - https://one.one.one.one
+fallbackUpstreams:
+  - udp://1.1.1.1:53
+  - tls://dns.quad9.net
+  - https://dns.quad9.net/dns-query
 
 domains:
   - domain: google.com
