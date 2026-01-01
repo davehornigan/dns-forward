@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,8 +29,8 @@ import (
 )
 
 const (
-	defaultListenAddr = ":53"
-	defaultTimeout    = 5 * time.Second
+	defaultListenAddr           = ":53"
+	defaultTimeout              = 5 * time.Second
 	defaultRouterOSCacheRefresh = 5 * time.Minute
 )
 
@@ -50,6 +52,7 @@ type HTTPConfig struct {
 type OutputConfig struct {
 	RouterOS *RouterOSConfig   `yaml:"routerOsApi"`
 	File     *FileOutputConfig `yaml:"file"`
+	Webhook  *WebhookConfig    `yaml:"webhook"`
 }
 
 type FileOutputConfig struct {
@@ -98,6 +101,11 @@ type RouterOSConfig struct {
 	RecordType      string  `yaml:"recordType"`
 }
 
+type WebhookConfig struct {
+	Method string `yaml:"method"`
+	URL    string `yaml:"url"`
+}
+
 type Upstream struct {
 	Raw      string
 	Kind     string
@@ -111,6 +119,7 @@ type Resolver struct {
 	fallbackUpstreams []Upstream
 	rules             []DomainRule
 	writers           []AddressWriter
+	webhooks          []*WebhookSender
 	timeout           time.Duration
 	http              *http.Client
 	fallbackCache     map[string]cachedResponse
@@ -144,6 +153,12 @@ type FileWriter struct {
 type cachedResponse struct {
 	resp      *dns.Msg
 	expiresAt time.Time
+}
+
+type WebhookSender struct {
+	method string
+	url    string
+	client *http.Client
 }
 
 func main() {
@@ -193,6 +208,21 @@ func main() {
 	}
 
 	var writers []AddressWriter
+	var webhooks []*WebhookSender
+
+	httpClient := &http.Client{
+		Timeout: timeout,
+	}
+	if cfg.HTTP.Proxy != "" {
+		proxyURL, err := url.Parse(cfg.HTTP.Proxy)
+		if err != nil {
+			slog.Error("http proxy", "error", err)
+			os.Exit(1)
+		}
+		httpClient.Transport = &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		}
+	}
 
 	for _, output := range cfg.Outputs {
 		if output.RouterOS != nil && output.RouterOS.Host != "" {
@@ -212,10 +242,19 @@ func main() {
 			}
 			writers = append(writers, fileWriter)
 		}
+
+		if output.Webhook != nil && strings.TrimSpace(output.Webhook.URL) != "" {
+			sender, err := NewWebhookSender(*output.Webhook, httpClient)
+			if err != nil {
+				slog.Error("webhook", "error", err)
+				os.Exit(1)
+			}
+			webhooks = append(webhooks, sender)
+		}
 	}
 
-	if len(writers) == 0 {
-		slog.Error("no outputs configured (outputs[].routerOsApi.host or outputs[].file.path required)")
+	if len(writers) == 0 && len(webhooks) == 0 {
+		slog.Error("no outputs configured (outputs[].routerOsApi.host, outputs[].file.path, or outputs[].webhook.url required)")
 		os.Exit(1)
 	}
 
@@ -227,6 +266,13 @@ func main() {
 		}
 		if output.File != nil && output.File.Path != "" {
 			outputSummaries = append(outputSummaries, "file:"+output.File.Path)
+		}
+		if output.Webhook != nil && strings.TrimSpace(output.Webhook.URL) != "" {
+			method := strings.ToUpper(strings.TrimSpace(output.Webhook.Method))
+			if method == "" {
+				method = http.MethodPost
+			}
+			outputSummaries = append(outputSummaries, "webhook:"+method+" "+output.Webhook.URL)
 		}
 	}
 
@@ -241,25 +287,12 @@ func main() {
 		"outputs", outputSummaries,
 	)
 
-	httpClient := &http.Client{
-		Timeout: timeout,
-	}
-	if cfg.HTTP.Proxy != "" {
-		proxyURL, err := url.Parse(cfg.HTTP.Proxy)
-		if err != nil {
-			slog.Error("http proxy", "error", err)
-			os.Exit(1)
-		}
-		httpClient.Transport = &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
-		}
-	}
-
 	resolver := &Resolver{
 		upstreams:         upstreams,
 		fallbackUpstreams: fallbackUpstreams,
 		rules:             cfg.Domains,
 		writers:           writers,
+		webhooks:          webhooks,
 		timeout:           timeout,
 		http:              httpClient,
 		fallbackCache:     make(map[string]cachedResponse),
@@ -533,6 +566,31 @@ func (r *Resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			hostSeen = true
 			for _, ip := range extractIPs(resp.Answer) {
 				ipSet[ip] = true
+			}
+		}
+		var webhookList string
+		if listName != "" {
+			webhookList = listName
+		} else {
+			for _, writer := range r.writers {
+				if writer.DefaultListName() != "" {
+					webhookList = writer.DefaultListName()
+					break
+				}
+			}
+		}
+		if hostSeen && len(r.webhooks) > 0 && len(ipSet) > 0 {
+			ips := make([]string, 0, len(ipSet))
+			for ip := range ipSet {
+				ips = append(ips, ip)
+			}
+			sort.Strings(ips)
+			ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+			defer cancel()
+			for _, webhook := range r.webhooks {
+				if err := webhook.Send(ctx, webhookList, domain, ips); err != nil {
+					slog.Error("webhook send", "url", webhook.url, "error", err)
+				}
 			}
 		}
 		for _, writer := range r.writers {
@@ -1150,6 +1208,28 @@ func NewFileWriter(cfg FileOutputConfig) (*FileWriter, error) {
 	return writer, nil
 }
 
+func NewWebhookSender(cfg WebhookConfig, client *http.Client) (*WebhookSender, error) {
+	endpoint := strings.TrimSpace(cfg.URL)
+	if endpoint == "" {
+		return nil, errors.New("webhook url is required")
+	}
+	if _, err := url.ParseRequestURI(endpoint); err != nil {
+		return nil, fmt.Errorf("invalid webhook url %q: %w", endpoint, err)
+	}
+	method := strings.ToUpper(strings.TrimSpace(cfg.Method))
+	if method == "" {
+		method = http.MethodPost
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return &WebhookSender{
+		method: method,
+		url:    endpoint,
+		client: client,
+	}, nil
+}
+
 func formatRouterOSAddress(cfg RouterOSConfig) string {
 	port := cfg.Port
 	if port == 0 {
@@ -1383,6 +1463,62 @@ func (f *FileWriter) getWriter(listName string) (*csv.Writer, error) {
 	f.files[listName] = file
 	f.writers[listName] = writer
 	return writer, nil
+}
+
+func (w *WebhookSender) Send(ctx context.Context, listName, domain string, addresses []string) error {
+	var (
+		req *http.Request
+		err error
+	)
+	if w.method == http.MethodGet {
+		endpoint, err := url.Parse(w.url)
+		if err != nil {
+			return err
+		}
+		values := endpoint.Query()
+		if listName != "" {
+			values.Set("list", listName)
+		}
+		values.Set("domain", domain)
+		for _, address := range addresses {
+			values.Add("addresses[]", address)
+		}
+		endpoint.RawQuery = values.Encode()
+		req, err = http.NewRequestWithContext(ctx, w.method, endpoint.String(), nil)
+		if err != nil {
+			return err
+		}
+	} else {
+		payload := struct {
+			List      string   `json:"list"`
+			Domain    string   `json:"domain"`
+			Addresses []string `json:"addresses"`
+		}{
+			List:      listName,
+			Domain:    domain,
+			Addresses: addresses,
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		req, err = http.NewRequestWithContext(ctx, w.method, w.url, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("webhook status %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func shouldUpdateTTL(global *bool, override *bool) bool {

@@ -39,6 +39,9 @@ outputs:
   - file:
       path: ./data
       addressListName: my_resolved_domains
+  - webhook:
+      method: POST
+      url: https://example.com/dns-webhook
 
 listenAddr: ":55353"
 timeout: 5s

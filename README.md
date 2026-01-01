@@ -49,6 +49,9 @@ outputs:
   - file:
       path: ./data
       addressListName: my_resolved_domains
+  - webhook:
+      method: POST
+      url: https://example.com/dns-webhook
 
 listenAddr: ":55353"
 timeout: 5s
@@ -63,6 +66,7 @@ Notes:
 - `recordType: host` writes the domain itself into the address-list.
 - File output writes a CSV with two columns: `domain`, `ip`. The file name is
   `<path>/<addressListName>.csv`, derived from the effective list for each domain.
+- Webhook output sends JSON: `{"list":"name","domain":"example.com","addresses":["1.2.3.4"]}`. Method defaults to `POST`. For `GET`, data is sent as query params: `list`, `domain`, and repeated `addresses[]`.
 
 ## Run
 ```bash
