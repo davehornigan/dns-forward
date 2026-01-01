@@ -19,15 +19,9 @@ domains:
   - domain: google.com
     matchSubDomains: true
     maxDepth: ~
-    ttl: 10m
-    updateTTL: true
-    recordType: ip
     listName: google
   - domain: openai.com
     matchSubDomains: true
-    ttl: 10m
-    updateTTL: false
-    recordType: host
     listName: openai
   - domain: example.com
     matchSubDomains: false

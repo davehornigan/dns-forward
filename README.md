@@ -36,8 +36,6 @@ domains:
     maxDepth: ~
   - domain: openai.com
     matchSubDomains: true
-    ttl: 10m
-    recordType: host
     listName: openai
   - domain: example.com
     matchSubDomains: false
@@ -81,7 +79,6 @@ Upstreams:
 Domains:
 - `domains[].listName` overrides the output list name for all outputs; otherwise each output uses its own `listName`.
 - `domains[].outputs` controls which outputs are used by ID. If omitted or null, all outputs are used. If empty, nothing is written.
-- `recordType: host` writes the domain itself into the RouterOS address-list.
 
 Outputs:
 - All outputs are optional, but at least one must be configured. Every output requires a unique `id`.

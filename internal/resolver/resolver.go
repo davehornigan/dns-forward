@@ -160,8 +160,6 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	ruleList := strings.TrimSpace(listName)
 	ruleOutputs := normalizeOutputs(rule.Outputs)
 
-	recordType := strings.ToLower(strings.TrimSpace(rule.RecordType))
-
 	domain := strings.TrimSuffix(strings.ToLower(q.Name), ".")
 
 	go func() {
@@ -215,33 +213,30 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			switch writer.OutputType() {
 			case outputs.OutputFile:
 				for ip := range ipSet {
-					r.writeAddress(writer, effectiveList, domain, ip, rule.TTL, rule.UpdateTTL)
+					r.writeAddress(writer, effectiveList, domain, ip)
 				}
 			case outputs.OutputRouterOS:
-				effectiveRecordType := recordType
-				if effectiveRecordType == "" {
-					effectiveRecordType = writer.DefaultRecordType()
-				}
+				effectiveRecordType := writer.DefaultRecordType()
 				if effectiveRecordType == "host" {
 					if hostSeen {
-						r.writeAddress(writer, effectiveList, domain, domain, rule.TTL, rule.UpdateTTL)
+						r.writeAddress(writer, effectiveList, domain, domain)
 					}
-				} else {
-					for ip := range ipSet {
-						r.writeAddress(writer, effectiveList, domain, ip, rule.TTL, rule.UpdateTTL)
-					}
+					break
+				}
+				for ip := range ipSet {
+					r.writeAddress(writer, effectiveList, domain, ip)
 				}
 			default:
 				for ip := range ipSet {
-					r.writeAddress(writer, effectiveList, domain, ip, rule.TTL, rule.UpdateTTL)
+					r.writeAddress(writer, effectiveList, domain, ip)
 				}
 			}
 		}
 	}()
 }
 
-func (r *Resolver) writeAddress(writer outputs.AddressWriter, listName, domain, address string, ttl *string, updateTTL *bool) {
-	if err := writer.EnsureAddress(listName, domain, address, ttl, updateTTL); err != nil {
+func (r *Resolver) writeAddress(writer outputs.AddressWriter, listName, domain, address string) {
+	if err := writer.EnsureAddress(listName, domain, address, nil, nil); err != nil {
 		slog.Error("write address", writeAddressAttrs(DNSLog{
 			List:    listName,
 			Domain:  domain,

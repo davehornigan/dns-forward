@@ -38,10 +38,7 @@ type DomainRule struct {
 	Domain          string   `yaml:"domain"`
 	MatchSubDomains bool     `yaml:"matchSubDomains"`
 	MaxDepth        *int     `yaml:"maxDepth"`
-	TTL             *string  `yaml:"ttl"`
-	RecordType      string   `yaml:"recordType"`
 	ListName        string   `yaml:"listName"`
-	UpdateTTL       *bool    `yaml:"updateTTL"`
 	Outputs         []string `yaml:"outputs"`
 }
 

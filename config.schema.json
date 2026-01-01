@@ -41,10 +41,7 @@
         "domain": { "type": "string" },
         "matchSubDomains": { "type": ["boolean", "null"] },
         "maxDepth": { "type": ["integer", "null"], "minimum": 0 },
-        "ttl": { "type": ["string", "null"] },
-        "recordType": { "type": ["string", "null"], "enum": ["ip", "host", null] },
         "listName": { "type": ["string", "null"] },
-        "updateTTL": { "type": ["boolean", "null"] },
         "outputs": { "type": ["array", "null"], "items": { "type": "string" } }
       },
       "required": ["domain"]
