@@ -35,13 +35,14 @@ type OutputConfig struct {
 }
 
 type DomainRule struct {
-	Domain          string  `yaml:"domain"`
-	MatchSubDomains bool    `yaml:"matchSubDomains"`
-	MaxDepth        *int    `yaml:"maxDepth"`
-	TTL             *string `yaml:"ttl"`
-	RecordType      string  `yaml:"recordType"`
-	AddressListName string  `yaml:"addressListName"`
-	UpdateTTL       *bool   `yaml:"updateTTL"`
+	Domain          string   `yaml:"domain"`
+	MatchSubDomains bool     `yaml:"matchSubDomains"`
+	MaxDepth        *int     `yaml:"maxDepth"`
+	TTL             *string  `yaml:"ttl"`
+	RecordType      string   `yaml:"recordType"`
+	ListName        string   `yaml:"listName"`
+	UpdateTTL       *bool    `yaml:"updateTTL"`
+	Outputs         []string `yaml:"outputs"`
 }
 
 func (o *OutputConfig) UnmarshalYAML(node *yaml.Node) error {

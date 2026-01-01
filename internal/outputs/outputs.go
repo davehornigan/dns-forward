@@ -33,12 +33,15 @@ const (
 const defaultRouterOSCacheRefresh = 5 * time.Minute
 
 type FileOutputConfig struct {
+	ID       string `yaml:"id"`
 	Path     string `yaml:"path"`
 	ListName string `yaml:"listName"`
+	Format   string `yaml:"format"`
 }
 
 type RosApiAddressListConfig struct {
 	Access     RosApiAccessConfig `yaml:"-"`
+	ID         string             `yaml:"id"`
 	ListName   string             `yaml:"listName"`
 	TTL        *string            `yaml:"ttl"`
 	UpdateTTL  *bool              `yaml:"updateTTL"`
@@ -55,6 +58,7 @@ func (c *RosApiAddressListConfig) UnmarshalYAML(node *yaml.Node) error {
 	c.TTL = cfg.TTL
 	c.UpdateTTL = cfg.UpdateTTL
 	c.RecordType = cfg.RecordType
+	c.ID = cfg.ID
 
 	var access RosApiAccessConfig
 	if err := node.Decode(&access); err != nil {
@@ -65,6 +69,7 @@ func (c *RosApiAddressListConfig) UnmarshalYAML(node *yaml.Node) error {
 }
 
 type WebhookConfig struct {
+	ID       string `yaml:"id"`
 	Method   string `yaml:"method"`
 	URL      string `yaml:"url"`
 	ListName string `yaml:"listName"`
@@ -94,12 +99,14 @@ type RouterOSClient struct {
 }
 
 type FileWriter struct {
-	basePath string
-	listName string
-	writers  map[string]*csv.Writer
-	files    map[string]*os.File
-	cache    map[string]map[string]bool
-	mu       sync.Mutex
+	basePath    string
+	listName    string
+	format      string
+	writers     map[string]*csv.Writer
+	lineWriters map[string]*bufio.Writer
+	files       map[string]*os.File
+	cache       map[string]map[string]bool
+	mu          sync.Mutex
 }
 
 type WebhookSender struct {
@@ -186,15 +193,26 @@ func NewFileWriter(cfg FileOutputConfig) (*FileWriter, error) {
 	if listName == "" {
 		return nil, errors.New("file output listName is required")
 	}
+	format := strings.ToLower(strings.TrimSpace(cfg.Format))
+	if format == "" {
+		format = "csv"
+	}
+	switch format {
+	case "csv", "ipset", "nftset":
+	default:
+		return nil, fmt.Errorf("file output format must be csv, ipset, or nftset, got %q", format)
+	}
 	if err := os.MkdirAll(basePath, 0755); err != nil {
 		return nil, err
 	}
 	writer := &FileWriter{
-		basePath: basePath,
-		listName: listName,
-		writers:  make(map[string]*csv.Writer),
-		files:    make(map[string]*os.File),
-		cache:    make(map[string]map[string]bool),
+		basePath:    basePath,
+		listName:    listName,
+		format:      format,
+		writers:     make(map[string]*csv.Writer),
+		lineWriters: make(map[string]*bufio.Writer),
+		files:       make(map[string]*os.File),
+		cache:       make(map[string]map[string]bool),
 	}
 	return writer, nil
 }
@@ -399,6 +417,9 @@ func (f *FileWriter) EnsureAddress(listName, domain, address string, ttl *string
 		return nil
 	}
 	key := fmt.Sprintf("%s|%s", listName, address)
+	if f.format != "csv" {
+		key = fmt.Sprintf("%s|%s", listName, domain)
+	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -430,6 +451,13 @@ func (f *FileWriter) OutputType() string {
 }
 
 func (f *FileWriter) writeLine(listName, domain, address string) error {
+	switch f.format {
+	case "ipset":
+		return f.writePlainLine(listName, fmt.Sprintf("ipset=/%s/%s", domain, listName))
+	case "nftset":
+		return f.writePlainLine(listName, fmt.Sprintf("nftset=/%s/%s", domain, listName))
+	default:
+	}
 	writer, err := f.getWriter(listName)
 	if err != nil {
 		return err
@@ -455,6 +483,34 @@ func (f *FileWriter) getWriter(listName string) (*csv.Writer, error) {
 	writer := csv.NewWriter(buf)
 	f.files[listName] = file
 	f.writers[listName] = writer
+	return writer, nil
+}
+
+func (f *FileWriter) writePlainLine(listName, line string) error {
+	writer, err := f.getLineWriter(listName)
+	if err != nil {
+		return err
+	}
+	if _, err := writer.WriteString(line + "\n"); err != nil {
+		return err
+	}
+	return writer.Flush()
+}
+
+func (f *FileWriter) getLineWriter(listName string) (*bufio.Writer, error) {
+	if writer, ok := f.lineWriters[listName]; ok {
+		return writer, nil
+	}
+	flags := os.O_CREATE | os.O_WRONLY | os.O_APPEND
+	ext := ".conf"
+	filePath := filepath.Join(f.basePath, fmt.Sprintf("%s%s", listName, ext))
+	file, err := os.OpenFile(filePath, flags, 0644)
+	if err != nil {
+		return nil, err
+	}
+	writer := bufio.NewWriter(file)
+	f.files[listName] = file
+	f.lineWriters[listName] = writer
 	return writer, nil
 }
 

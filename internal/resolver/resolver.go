@@ -35,8 +35,7 @@ type Resolver struct {
 	upstreams         []upstreams.Upstream
 	fallbackUpstreams []upstreams.Upstream
 	rules             []config.DomainRule
-	writers           []outputs.AddressWriter
-	webhooks          []*outputs.WebhookSender
+	outputs           []OutputTarget
 	timeout           time.Duration
 	dnsTimeout        time.Duration
 	httpTimeout       time.Duration
@@ -50,13 +49,18 @@ type cachedResponse struct {
 	expiresAt time.Time
 }
 
-func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, rules []config.DomainRule, writers []outputs.AddressWriter, webhooks []*outputs.WebhookSender, timeout, dnsTimeout, httpTimeout time.Duration, dohHTTP *http.Client) *Resolver {
+type OutputTarget struct {
+	ID      string
+	Writer  outputs.AddressWriter
+	Webhook *outputs.WebhookSender
+}
+
+func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, rules []config.DomainRule, outputsList []OutputTarget, timeout, dnsTimeout, httpTimeout time.Duration, dohHTTP *http.Client) *Resolver {
 	return &Resolver{
 		upstreams:         upstreamsList,
 		fallbackUpstreams: fallbackList,
 		rules:             rules,
-		writers:           writers,
-		webhooks:          webhooks,
+		outputs:           outputsList,
 		timeout:           timeout,
 		dnsTimeout:        dnsTimeout,
 		httpTimeout:       httpTimeout,
@@ -152,8 +156,9 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	listName := rule.AddressListName
+	listName := rule.ListName
 	ruleList := strings.TrimSpace(listName)
+	ruleOutputs := normalizeOutputs(rule.Outputs)
 
 	recordType := strings.ToLower(strings.TrimSpace(rule.RecordType))
 
@@ -171,7 +176,7 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 				ipSet[ip] = true
 			}
 		}
-		if hostSeen && len(r.webhooks) > 0 && len(ipSet) > 0 {
+		if hostSeen && len(ipSet) > 0 && shouldWriteOutputs(ruleOutputs, true) {
 			ips := make([]string, 0, len(ipSet))
 			for ip := range ipSet {
 				ips = append(ips, ip)
@@ -179,13 +184,26 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			sort.Strings(ips)
 			ctx, cancel := context.WithTimeout(context.Background(), r.httpTimeout)
 			defer cancel()
-			for _, webhook := range r.webhooks {
-				if err := webhook.Send(ctx, ruleList, domain, ips); err != nil {
-					slog.Error("webhook send", "url", webhook.URL(), "error", err)
+			for _, target := range r.outputs {
+				if target.Webhook == nil {
+					continue
+				}
+				if !shouldWriteTarget(ruleOutputs, target.ID) {
+					continue
+				}
+				if err := target.Webhook.Send(ctx, ruleList, domain, ips); err != nil {
+					slog.Error("webhook send", "url", target.Webhook.URL(), "error", err)
 				}
 			}
 		}
-		for _, writer := range r.writers {
+		for _, target := range r.outputs {
+			if target.Writer == nil {
+				continue
+			}
+			if !shouldWriteTarget(ruleOutputs, target.ID) {
+				continue
+			}
+			writer := target.Writer
 			effectiveList := ruleList
 			if effectiveList == "" {
 				effectiveList = writer.DefaultListName()
@@ -587,4 +605,41 @@ func (r *Resolver) matchDomain(qname string) (bool, config.DomainRule) {
 		}
 	}
 	return false, config.DomainRule{}
+}
+
+func normalizeOutputs(outputsList []string) []string {
+	if outputsList == nil {
+		return nil
+	}
+	out := make([]string, 0, len(outputsList))
+	for _, id := range outputsList {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+func shouldWriteOutputs(outputsList []string, hasAddresses bool) bool {
+	if outputsList == nil {
+		return hasAddresses
+	}
+	return len(outputsList) > 0 && hasAddresses
+}
+
+func shouldWriteTarget(outputsList []string, id string) bool {
+	if outputsList == nil {
+		return true
+	}
+	if len(outputsList) == 0 {
+		return false
+	}
+	for _, allowed := range outputsList {
+		if allowed == id {
+			return true
+		}
+	}
+	return false
 }

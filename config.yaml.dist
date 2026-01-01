@@ -22,18 +22,19 @@ domains:
     ttl: 10m
     updateTTL: true
     recordType: ip
-    addressListName: google
+    listName: google
   - domain: openai.com
     matchSubDomains: true
     ttl: 10m
     updateTTL: false
     recordType: host
-    addressListName: openai
+    listName: openai
   - domain: example.com
     matchSubDomains: false
 
 outputs:
   - type: rosApiAddressList
+    id: ros_main
     host: 10.0.0.1
     port: ~
     useTLS: false
@@ -44,9 +45,12 @@ outputs:
     updateTTL: true
     recordType: ip
   - type: file
+    id: file_main
     path: ./data
     listName: my_resolved_domains
+    format: csv
   - type: webhook
+    id: webhook_main
     method: POST
     url: https://example.com/dns-webhook
     listName: my_resolved_domains

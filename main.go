@@ -74,8 +74,8 @@ func main() {
 		httpTimeout = timeout
 	}
 
-	var writers []outputs.AddressWriter
-	var webhooks []*outputs.WebhookSender
+	var outputTargets []resolver.OutputTarget
+	outputIDs := make(map[string]struct{})
 
 	dohHTTP := &http.Client{
 		Timeout: dnsTimeout,
@@ -85,47 +85,61 @@ func main() {
 	}
 
 	for _, output := range cfg.Outputs {
+		outputID := ""
 		switch output.Type {
 		case "rosApiAddressList":
 			if output.RosApiAddressList == nil {
 				slog.Error("rosApiAddressList config missing")
 				os.Exit(1)
 			}
+			outputID = strings.TrimSpace(output.RosApiAddressList.ID)
 			ros, err := outputs.NewRouterOSClient(*output.RosApiAddressList, httpTimeout)
 			if err != nil {
 				slog.Error("routeros", "error", err)
 				os.Exit(1)
 			}
-			writers = append(writers, ros)
+			outputTargets = append(outputTargets, resolver.OutputTarget{ID: outputID, Writer: ros})
 		case "file":
 			if output.File == nil {
 				slog.Error("file config missing")
 				os.Exit(1)
 			}
+			outputID = strings.TrimSpace(output.File.ID)
 			fileWriter, err := outputs.NewFileWriter(*output.File)
 			if err != nil {
 				slog.Error("file writer", "error", err)
 				os.Exit(1)
 			}
-			writers = append(writers, fileWriter)
+			outputTargets = append(outputTargets, resolver.OutputTarget{ID: outputID, Writer: fileWriter})
 		case "webhook":
 			if output.Webhook == nil {
 				slog.Error("webhook config missing")
 				os.Exit(1)
 			}
+			outputID = strings.TrimSpace(output.Webhook.ID)
 			sender, err := outputs.NewWebhookSender(*output.Webhook, webhookHTTP)
 			if err != nil {
 				slog.Error("webhook", "error", err)
 				os.Exit(1)
 			}
-			webhooks = append(webhooks, sender)
+			outputTargets = append(outputTargets, resolver.OutputTarget{ID: outputID, Webhook: sender})
 		default:
 			slog.Error("unsupported output type", "type", output.Type)
 			os.Exit(1)
 		}
+
+		if outputID == "" {
+			slog.Error("output id is required", "type", output.Type)
+			os.Exit(1)
+		}
+		if _, exists := outputIDs[outputID]; exists {
+			slog.Error("output id must be unique", "id", outputID)
+			os.Exit(1)
+		}
+		outputIDs[outputID] = struct{}{}
 	}
 
-	if len(writers) == 0 && len(webhooks) == 0 {
+	if len(outputTargets) == 0 {
 		slog.Error("no outputs configured (outputs[].type required)")
 		os.Exit(1)
 	}
@@ -138,14 +152,14 @@ func main() {
 				summaryCfg := output.RosApiAddressList.Access
 				if err := outputs.ApplyHostOverrides(&summaryCfg); err == nil {
 					address := outputs.FormatRouterOSAddress(summaryCfg)
-					outputSummaries = append(outputSummaries, "rosApiAddressList:"+address)
+					outputSummaries = append(outputSummaries, "rosApiAddressList:"+output.RosApiAddressList.ID+"@"+address)
 				} else {
-					outputSummaries = append(outputSummaries, "rosApiAddressList:"+output.RosApiAddressList.Access.Host)
+					outputSummaries = append(outputSummaries, "rosApiAddressList:"+output.RosApiAddressList.ID+"@"+output.RosApiAddressList.Access.Host)
 				}
 			}
 		case "file":
 			if output.File != nil && output.File.Path != "" {
-				outputSummaries = append(outputSummaries, "file:"+output.File.Path)
+				outputSummaries = append(outputSummaries, "file:"+output.File.ID+"@"+output.File.Path)
 			}
 		case "webhook":
 			if output.Webhook != nil && strings.TrimSpace(output.Webhook.URL) != "" {
@@ -153,7 +167,7 @@ func main() {
 				if method == "" {
 					method = http.MethodPost
 				}
-				outputSummaries = append(outputSummaries, "webhook:"+method+" "+output.Webhook.URL)
+				outputSummaries = append(outputSummaries, "webhook:"+output.Webhook.ID+" "+method+" "+output.Webhook.URL)
 			}
 		}
 	}
@@ -169,7 +183,7 @@ func main() {
 		"outputs", outputSummaries,
 	)
 
-	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, writers, webhooks, timeout, dnsTimeout, httpTimeout, dohHTTP)
+	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, outputTargets, timeout, dnsTimeout, httpTimeout, dohHTTP)
 
 	addr := cfg.Server.ListenAddr
 	if addr == "" {

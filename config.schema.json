@@ -43,8 +43,9 @@
         "maxDepth": { "type": ["integer", "null"], "minimum": 0 },
         "ttl": { "type": ["string", "null"] },
         "recordType": { "type": ["string", "null"], "enum": ["ip", "host", null] },
-        "addressListName": { "type": ["string", "null"] },
-        "updateTTL": { "type": ["boolean", "null"] }
+        "listName": { "type": ["string", "null"] },
+        "updateTTL": { "type": ["boolean", "null"] },
+        "outputs": { "type": ["array", "null"], "items": { "type": "string" } }
       },
       "required": ["domain"]
     },
@@ -60,6 +61,7 @@
       "additionalProperties": false,
       "properties": {
         "type": { "const": "rosApiAddressList" },
+        "id": { "type": "string" },
         "host": { "type": "string" },
         "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
         "useTLS": { "type": ["boolean", "null"] },
@@ -70,28 +72,31 @@
         "updateTTL": { "type": ["boolean", "null"] },
         "recordType": { "type": "string", "enum": ["ip", "host"] }
       },
-      "required": ["type", "host", "username", "password", "listName", "recordType"]
+      "required": ["type", "id", "host", "username", "password", "listName", "recordType"]
     },
     "outputFile": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "type": { "const": "file" },
+        "id": { "type": "string" },
         "path": { "type": "string" },
-        "listName": { "type": "string" }
+        "listName": { "type": "string" },
+        "format": { "type": "string", "enum": ["csv", "ipset", "nftset"] }
       },
-      "required": ["type", "path", "listName"]
+      "required": ["type", "id", "path", "listName"]
     },
     "outputWebhook": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "type": { "const": "webhook" },
+        "id": { "type": "string" },
         "method": { "type": ["string", "null"] },
         "url": { "type": "string" },
         "listName": { "type": "string" }
       },
-      "required": ["type", "url", "listName"]
+      "required": ["type", "id", "url", "listName"]
     }
   }
 }

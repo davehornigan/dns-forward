@@ -38,12 +38,13 @@ domains:
     matchSubDomains: true
     ttl: 10m
     recordType: host
-    addressListName: openai
+    listName: openai
   - domain: example.com
     matchSubDomains: false
 
 outputs:
   - type: rosApiAddressList
+    id: ros_main
     host: 10.0.0.1
     port: 8728
     useTLS: false
@@ -54,9 +55,12 @@ outputs:
     updateTTL: true
     recordType: ip
   - type: file
+    id: file_main
     path: ./data
     listName: my_resolved_domains
+    format: csv
   - type: webhook
+    id: webhook_main
     method: POST
     url: https://example.com/dns-webhook
     listName: my_resolved_domains
@@ -75,13 +79,16 @@ Upstreams:
 - `fallbackUpstreams` are only used when no primary upstream returns an address, and their answers are not written to address lists. If omitted, defaults to `udp://1.1.1.1:53`.
 
 Domains:
-- `domains[].addressListName` overrides the output list name for all outputs; otherwise each output uses its own `listName`.
+- `domains[].listName` overrides the output list name for all outputs; otherwise each output uses its own `listName`.
+- `domains[].outputs` controls which outputs are used by ID. If omitted or null, all outputs are used. If empty, nothing is written.
 - `recordType: host` writes the domain itself into the RouterOS address-list.
 
 Outputs:
-- All outputs are optional, but at least one must be configured.
+- All outputs are optional, but at least one must be configured. Every output requires a unique `id`.
 - `rosApiAddressList` supports `host` with optional scheme/port; only `http`/`https` are supported. If omitted, `http` is assumed. When `useTLS` or `port` are omitted, they inherit from the host URL.
-- File output writes a CSV with two columns: `domain`, `ip`. The file name is `<path>/<listName>.csv`.
+- File output `format` can be `csv` (default), `ipset`, or `nftset`. CSV writes `domain,ip` rows to `<path>/<listName>.csv`. `ipset` and `nftset` write dnsmasq rules to `<path>/<listName>.conf`.
+- `ipset` example: `ipset=/showip.net/LIST_NAME`
+- `nftset` example: `nftset=/showip.net/4#inet#fw4#LIST_NAME`
 - Webhook output sends JSON: `{"list":"name","domain":"example.com","addresses":["1.2.3.4"]}`. Method defaults to `POST`. For `GET`, data is sent as query params: `list`, `domain`, and repeated `addresses[]`. `listName` is required.
 
 ## Run
