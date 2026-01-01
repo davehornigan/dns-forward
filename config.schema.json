@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "domains-resolver config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "upstreams": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "fallbackUpstreams": {
+      "type": ["array", "null"],
+      "items": { "type": "string" }
+    },
+    "domains": {
+      "type": ["array", "null"],
+      "items": { "$ref": "#/$defs/domainRule" }
+    },
+    "outputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/output" }
+    },
+    "server": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "debug": { "type": ["boolean", "null"] },
+        "listenAddr": { "type": ["string", "null"] },
+        "timeout": { "type": ["string", "null"] },
+        "dnsTimeout": { "type": ["string", "null"] },
+        "httpTimeout": { "type": ["string", "null"] }
+      }
+    }
+  },
+  "required": ["upstreams", "outputs"],
+  "$defs": {
+    "domainRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "domain": { "type": "string" },
+        "matchSubDomains": { "type": ["boolean", "null"] },
+        "maxDepth": { "type": ["integer", "null"], "minimum": 0 },
+        "ttl": { "type": ["string", "null"] },
+        "recordType": { "type": ["string", "null"], "enum": ["ip", "host", null] },
+        "addressListName": { "type": ["string", "null"] },
+        "updateTTL": { "type": ["boolean", "null"] }
+      },
+      "required": ["domain"]
+    },
+    "output": {
+      "oneOf": [
+        { "$ref": "#/$defs/outputRosApiAddressList" },
+        { "$ref": "#/$defs/outputFile" },
+        { "$ref": "#/$defs/outputWebhook" }
+      ]
+    },
+    "outputRosApiAddressList": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "rosApiAddressList" },
+        "host": { "type": "string" },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "useTLS": { "type": ["boolean", "null"] },
+        "username": { "type": "string" },
+        "password": { "type": "string" },
+        "listName": { "type": "string" },
+        "ttl": { "type": ["string", "null"] },
+        "updateTTL": { "type": ["boolean", "null"] },
+        "recordType": { "type": "string", "enum": ["ip", "host"] }
+      },
+      "required": ["type", "host", "username", "password", "listName", "recordType"]
+    },
+    "outputFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "file" },
+        "path": { "type": "string" },
+        "listName": { "type": "string" }
+      },
+      "required": ["type", "path", "listName"]
+    },
+    "outputWebhook": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "webhook" },
+        "method": { "type": ["string", "null"] },
+        "url": { "type": "string" },
+        "listName": { "type": "string" }
+      },
+      "required": ["type", "url", "listName"]
+    }
+  }
+}

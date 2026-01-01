@@ -1,0 +1,8 @@
+.gitignore
+.air.toml
+LICENSE
+Makefile
+README.md
+.github
+config.yaml
+config.schema.json

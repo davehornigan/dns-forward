@@ -1,3 +1,10 @@
+server:
+  listenAddr: ":55353"
+  timeout: 5s
+  dnsTimeout: 3s
+  httpTimeout: 10s
+  debug: false
+
 upstreams:
   - tls://dns.google
   - https://dns.google/dns-query
@@ -26,25 +33,20 @@ domains:
     matchSubDomains: false
 
 outputs:
-  - rosApi:
-      host: 10.0.0.1
-      port: ~
-      useTLS: false
-      username: admin
-      password: password
-      type: address-list
-      addressListName: my_resolved_domains
-      ttl: ~
-      updateTTL: true
-      recordType: ip
-  - file:
-      path: ./data
-      addressListName: my_resolved_domains
-  - webhook:
-      method: POST
-      url: https://example.com/dns-webhook
-      addressListName: my_resolved_domains
-
-listenAddr: ":55353"
-timeout: 5s
-debug: false
+  - type: rosApiAddressList
+    host: 10.0.0.1
+    port: ~
+    useTLS: false
+    username: admin
+    password: password
+    listName: my_resolved_domains
+    ttl: ~
+    updateTTL: true
+    recordType: ip
+  - type: file
+    path: ./data
+    listName: my_resolved_domains
+  - type: webhook
+    method: POST
+    url: https://example.com/dns-webhook
+    listName: my_resolved_domains
