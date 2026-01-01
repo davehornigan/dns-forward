@@ -50,7 +50,7 @@ type HTTPConfig struct {
 }
 
 type OutputConfig struct {
-	RouterOS *RouterOSConfig   `yaml:"routerOsApi"`
+	RouterOS *RouterOSConfig   `yaml:"rosApi"`
 	File     *FileOutputConfig `yaml:"file"`
 	Webhook  *WebhookConfig    `yaml:"webhook"`
 }
@@ -92,9 +92,10 @@ const (
 type RouterOSConfig struct {
 	Host            string  `yaml:"host"`
 	Port            int     `yaml:"port"`
-	UseTLS          bool    `yaml:"useTLS"`
+	UseTLS          *bool   `yaml:"useTLS"`
 	Username        string  `yaml:"username"`
 	Password        string  `yaml:"password"`
+	Type            string  `yaml:"type"`
 	AddressListName string  `yaml:"addressListName"`
 	TTL             *string `yaml:"ttl"`
 	UpdateTTL       *bool   `yaml:"updateTTL"`
@@ -102,8 +103,9 @@ type RouterOSConfig struct {
 }
 
 type WebhookConfig struct {
-	Method string `yaml:"method"`
-	URL    string `yaml:"url"`
+	Method          string `yaml:"method"`
+	URL             string `yaml:"url"`
+	AddressListName string `yaml:"addressListName"`
 }
 
 type Upstream struct {
@@ -156,9 +158,10 @@ type cachedResponse struct {
 }
 
 type WebhookSender struct {
-	method string
-	url    string
-	client *http.Client
+	listName string
+	method   string
+	url      string
+	client   *http.Client
 }
 
 func main() {
@@ -254,15 +257,20 @@ func main() {
 	}
 
 	if len(writers) == 0 && len(webhooks) == 0 {
-		slog.Error("no outputs configured (outputs[].routerOsApi.host, outputs[].file.path, or outputs[].webhook.url required)")
+		slog.Error("no outputs configured (outputs[].rosApi.host, outputs[].file.path, or outputs[].webhook.url required)")
 		os.Exit(1)
 	}
 
 	outputSummaries := make([]string, 0, len(cfg.Outputs))
 	for _, output := range cfg.Outputs {
 		if output.RouterOS != nil && output.RouterOS.Host != "" {
-			address := formatRouterOSAddress(*output.RouterOS)
-			outputSummaries = append(outputSummaries, "routeros:"+address)
+			summaryCfg := *output.RouterOS
+			if err := applyRouterOSHostOverrides(&summaryCfg); err == nil {
+				address := formatRouterOSAddress(summaryCfg)
+				outputSummaries = append(outputSummaries, "routeros:"+address)
+			} else {
+				outputSummaries = append(outputSummaries, "routeros:"+output.RouterOS.Host)
+			}
 		}
 		if output.File != nil && output.File.Path != "" {
 			outputSummaries = append(outputSummaries, "file:"+output.File.Path)
@@ -551,6 +559,7 @@ func (r *Resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	listName := rule.AddressListName
+	ruleList := strings.TrimSpace(listName)
 
 	recordType := strings.ToLower(strings.TrimSpace(rule.RecordType))
 
@@ -568,17 +577,6 @@ func (r *Resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 				ipSet[ip] = true
 			}
 		}
-		var webhookList string
-		if listName != "" {
-			webhookList = listName
-		} else {
-			for _, writer := range r.writers {
-				if writer.DefaultListName() != "" {
-					webhookList = writer.DefaultListName()
-					break
-				}
-			}
-		}
 		if hostSeen && len(r.webhooks) > 0 && len(ipSet) > 0 {
 			ips := make([]string, 0, len(ipSet))
 			for ip := range ipSet {
@@ -588,13 +586,13 @@ func (r *Resolver) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
 			defer cancel()
 			for _, webhook := range r.webhooks {
-				if err := webhook.Send(ctx, webhookList, domain, ips); err != nil {
+				if err := webhook.Send(ctx, ruleList, domain, ips); err != nil {
 					slog.Error("webhook send", "url", webhook.url, "error", err)
 				}
 			}
 		}
 		for _, writer := range r.writers {
-			effectiveList := listName
+			effectiveList := ruleList
 			if effectiveList == "" {
 				effectiveList = writer.DefaultListName()
 			}
@@ -1126,6 +1124,16 @@ func NewRouterOSClient(cfg RouterOSConfig) (*RouterOSClient, error) {
 	if cfg.Host == "" {
 		return nil, errors.New("routeros host is required")
 	}
+	if err := applyRouterOSHostOverrides(&cfg); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(cfg.Type) == "" {
+		cfg.Type = "address-list"
+	}
+	cfg.Type = strings.ToLower(strings.TrimSpace(cfg.Type))
+	if cfg.Type != "address-list" {
+		return nil, fmt.Errorf("routeros type must be address-list, got %q", cfg.Type)
+	}
 	if strings.TrimSpace(cfg.RecordType) == "" {
 		return nil, errors.New("routeros recordType is required")
 	}
@@ -1152,7 +1160,7 @@ func NewRouterOSClient(cfg RouterOSConfig) (*RouterOSClient, error) {
 		conn *routeros.Client
 		err  error
 	)
-	if cfg.UseTLS {
+	if effectiveUseTLS(cfg) {
 		conn, err = routeros.DialTLS(address, cfg.Username, cfg.Password, &tls.Config{})
 	} else {
 		conn, err = routeros.Dial(address, cfg.Username, cfg.Password)
@@ -1213,6 +1221,10 @@ func NewWebhookSender(cfg WebhookConfig, client *http.Client) (*WebhookSender, e
 	if endpoint == "" {
 		return nil, errors.New("webhook url is required")
 	}
+	listName := strings.TrimSpace(cfg.AddressListName)
+	if listName == "" {
+		return nil, errors.New("webhook addressListName is required")
+	}
 	if _, err := url.ParseRequestURI(endpoint); err != nil {
 		return nil, fmt.Errorf("invalid webhook url %q: %w", endpoint, err)
 	}
@@ -1224,16 +1236,17 @@ func NewWebhookSender(cfg WebhookConfig, client *http.Client) (*WebhookSender, e
 		client = http.DefaultClient
 	}
 	return &WebhookSender{
-		method: method,
-		url:    endpoint,
-		client: client,
+		listName: listName,
+		method:   method,
+		url:      endpoint,
+		client:   client,
 	}, nil
 }
 
 func formatRouterOSAddress(cfg RouterOSConfig) string {
 	port := cfg.Port
 	if port == 0 {
-		if cfg.UseTLS {
+		if effectiveUseTLS(cfg) {
 			port = 8729
 		} else {
 			port = 8728
@@ -1466,6 +1479,9 @@ func (f *FileWriter) getWriter(listName string) (*csv.Writer, error) {
 }
 
 func (w *WebhookSender) Send(ctx context.Context, listName, domain string, addresses []string) error {
+	if listName == "" {
+		listName = w.listName
+	}
 	var (
 		req *http.Request
 		err error
@@ -1476,9 +1492,7 @@ func (w *WebhookSender) Send(ctx context.Context, listName, domain string, addre
 			return err
 		}
 		values := endpoint.Query()
-		if listName != "" {
-			values.Set("list", listName)
-		}
+		values.Set("list", listName)
 		values.Set("domain", domain)
 		for _, address := range addresses {
 			values.Add("addresses[]", address)
@@ -1529,4 +1543,57 @@ func shouldUpdateTTL(global *bool, override *bool) bool {
 		return true
 	}
 	return *global
+}
+
+func applyRouterOSHostOverrides(cfg *RouterOSConfig) error {
+	if cfg == nil || cfg.Host == "" {
+		return nil
+	}
+	entry := cfg.Host
+	if !strings.Contains(entry, "://") {
+		entry = "http://" + entry
+	}
+	parsed, err := url.Parse(entry)
+	if err != nil {
+		return fmt.Errorf("invalid routeros host %q: %w", cfg.Host, err)
+	}
+	if parsed.Hostname() == "" {
+		return fmt.Errorf("invalid routeros host %q", cfg.Host)
+	}
+	schemeTLS := schemeUseTLS(parsed.Scheme)
+	if schemeTLS == nil {
+		return fmt.Errorf("unsupported routeros host scheme %q", parsed.Scheme)
+	}
+	if cfg.UseTLS == nil {
+		cfg.UseTLS = schemeTLS
+	}
+	if cfg.Port == 0 && parsed.Port() != "" {
+		port, err := strconv.Atoi(parsed.Port())
+		if err != nil {
+			return fmt.Errorf("invalid routeros port %q", parsed.Port())
+		}
+		cfg.Port = port
+	}
+	cfg.Host = parsed.Hostname()
+	return nil
+}
+
+func effectiveUseTLS(cfg RouterOSConfig) bool {
+	if cfg.UseTLS != nil {
+		return *cfg.UseTLS
+	}
+	return false
+}
+
+func schemeUseTLS(scheme string) *bool {
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "https":
+		value := true
+		return &value
+	case "http":
+		value := false
+		return &value
+	default:
+		return nil
+	}
 }

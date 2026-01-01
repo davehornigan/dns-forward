@@ -26,12 +26,13 @@ domains:
     matchSubDomains: false
 
 outputs:
-  - routerOsApi:
+  - rosApi:
       host: 10.0.0.1
       port: ~
       useTLS: false
       username: admin
       password: password
+      type: address-list
       addressListName: my_resolved_domains
       ttl: ~
       updateTTL: true
@@ -42,6 +43,7 @@ outputs:
   - webhook:
       method: POST
       url: https://example.com/dns-webhook
+      addressListName: my_resolved_domains
 
 listenAddr: ":55353"
 timeout: 5s
