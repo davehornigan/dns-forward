@@ -23,8 +23,13 @@ domains:
   - domain: openai.com
     matchSubDomains: true
     listName: openai
+    upstreamsOverride:
+      - tls://one.one.one.one
+      - https://one.one.one.one/dns-query
   - domain: example.com
     matchSubDomains: false
+    upstreamsBlacklist:
+      - https://dns.google/dns-query
 
 outputs:
   - type: rosApiAddressList

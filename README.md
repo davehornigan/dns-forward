@@ -37,8 +37,13 @@ domains:
   - domain: openai.com
     matchSubDomains: true
     listName: openai
+    upstreamsOverride:
+      - tls://one.one.one.one
+      - https://one.one.one.one/dns-query
   - domain: example.com
     matchSubDomains: false
+    upstreamsBlacklist:
+      - https://dns.google/dns-query
 
 outputs:
   - type: rosApiAddressList
@@ -79,6 +84,8 @@ Upstreams:
 Domains:
 - `domains[].listName` overrides the output list name for all outputs; otherwise each output uses its own `listName`.
 - `domains[].outputs` controls which outputs are used by ID. If omitted or null, all outputs are used. If empty, nothing is written.
+- `domains[].upstreamsOverride` overrides the primary upstream list for matching domains; if omitted, global `upstreams` are used. Fallback upstreams are always shared.
+- `domains[].upstreamsBlacklist` excludes entries from the primary upstream list for matching domains. Only one of `upstreamsOverride` or `upstreamsBlacklist` may be set.
 
 Outputs:
 - All outputs are optional, but at least one must be configured. Every output requires a unique `id`.

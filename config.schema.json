@@ -42,9 +42,12 @@
         "matchSubDomains": { "type": ["boolean", "null"] },
         "maxDepth": { "type": ["integer", "null"], "minimum": 0 },
         "listName": { "type": ["string", "null"] },
-        "outputs": { "type": ["array", "null"], "items": { "type": "string" } }
+        "outputs": { "type": ["array", "null"], "items": { "type": "string" } },
+        "upstreamsOverride": { "type": ["array", "null"], "items": { "type": "string" } },
+        "upstreamsBlacklist": { "type": ["array", "null"], "items": { "type": "string" } }
       },
-      "required": ["domain"]
+      "required": ["domain"],
+      "not": { "required": ["upstreamsOverride", "upstreamsBlacklist"] }
     },
     "output": {
       "oneOf": [

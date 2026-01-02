@@ -3,3 +3,5 @@ config.yaml
 bin/
 tmp/
 air_errors.log
+.gocache/
+.gomodcache/

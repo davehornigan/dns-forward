@@ -48,6 +48,55 @@ func main() {
 		os.Exit(1)
 	}
 
+	ruleUpstreams := make(map[int][]upstreams.Upstream)
+	for i, rule := range cfg.Domains {
+		if len(rule.UpstreamsOverride) > 0 && len(rule.UpstreamsBlacklist) > 0 {
+			slog.Error("domain upstreams cannot set both upstreamsOverride and upstreamsBlacklist", "domain", rule.Domain)
+			os.Exit(1)
+		}
+		if len(rule.UpstreamsOverride) == 0 && len(rule.UpstreamsBlacklist) == 0 {
+			continue
+		}
+		if len(rule.UpstreamsOverride) > 0 {
+			parsed, err := upstreams.ParseUpstreams(rule.UpstreamsOverride)
+			if err != nil {
+				slog.Error("parse domain upstreamsOverride", "domain", rule.Domain, "error", err)
+				os.Exit(1)
+			}
+			if len(parsed) == 0 {
+				slog.Error("domain upstreamsOverride empty", "domain", rule.Domain)
+				os.Exit(1)
+			}
+			ruleUpstreams[i] = parsed
+			continue
+		}
+		blacklist, err := upstreams.ParseUpstreams(rule.UpstreamsBlacklist)
+		if err != nil {
+			slog.Error("parse domain upstreamsBlacklist", "domain", rule.Domain, "error", err)
+			os.Exit(1)
+		}
+		if len(blacklist) == 0 {
+			slog.Error("domain upstreamsBlacklist empty", "domain", rule.Domain)
+			os.Exit(1)
+		}
+		blacklisted := make(map[string]struct{}, len(blacklist))
+		for _, entry := range blacklist {
+			blacklisted[upstreamKey(entry)] = struct{}{}
+		}
+		filtered := make([]upstreams.Upstream, 0, len(upstreamsList))
+		for _, upstream := range upstreamsList {
+			if _, ok := blacklisted[upstreamKey(upstream)]; ok {
+				continue
+			}
+			filtered = append(filtered, upstream)
+		}
+		if len(filtered) == 0 {
+			slog.Error("domain upstreamBlacklist removed all upstreams", "domain", rule.Domain)
+			os.Exit(1)
+		}
+		ruleUpstreams[i] = filtered
+	}
+
 	fallbackUpstreams, err := upstreams.ParseUpstreams(cfg.FallbackUpstreams)
 	if err != nil {
 		slog.Error("parse fallback upstreams", "error", err)
@@ -183,7 +232,7 @@ func main() {
 		"outputs", outputSummaries,
 	)
 
-	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, outputTargets, timeout, dnsTimeout, httpTimeout, dohHTTP)
+	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, ruleUpstreams, outputTargets, timeout, dnsTimeout, httpTimeout, dohHTTP)
 
 	addr := cfg.Server.ListenAddr
 	if addr == "" {
@@ -205,5 +254,19 @@ func main() {
 	if err := tcpSrv.ListenAndServe(); err != nil {
 		slog.Error("tcp server", "error", err)
 		os.Exit(1)
+	}
+}
+
+func upstreamKey(upstream upstreams.Upstream) string {
+	switch upstream.Kind {
+	case "udp", "tcp", "dot":
+		return upstream.Kind + "|" + upstream.Address
+	case "doh":
+		if upstream.URL != nil {
+			return upstream.Kind + "|" + upstream.URL.String()
+		}
+		return upstream.Kind + "|<nil>"
+	default:
+		return upstream.Kind + "|" + upstreams.Label(upstream)
 	}
 }

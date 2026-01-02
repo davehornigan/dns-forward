@@ -35,6 +35,7 @@ type Resolver struct {
 	upstreams         []upstreams.Upstream
 	fallbackUpstreams []upstreams.Upstream
 	rules             []config.DomainRule
+	ruleUpstreams     map[int][]upstreams.Upstream
 	outputs           []OutputTarget
 	timeout           time.Duration
 	dnsTimeout        time.Duration
@@ -55,11 +56,15 @@ type OutputTarget struct {
 	Webhook *outputs.WebhookSender
 }
 
-func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, rules []config.DomainRule, outputsList []OutputTarget, timeout, dnsTimeout, httpTimeout time.Duration, dohHTTP *http.Client) *Resolver {
+func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, rules []config.DomainRule, ruleUpstreams map[int][]upstreams.Upstream, outputsList []OutputTarget, timeout, dnsTimeout, httpTimeout time.Duration, dohHTTP *http.Client) *Resolver {
+	if ruleUpstreams == nil {
+		ruleUpstreams = make(map[int][]upstreams.Upstream)
+	}
 	return &Resolver{
 		upstreams:         upstreamsList,
 		fallbackUpstreams: fallbackList,
 		rules:             rules,
+		ruleUpstreams:     ruleUpstreams,
 		outputs:           outputsList,
 		timeout:           timeout,
 		dnsTimeout:        dnsTimeout,
@@ -119,21 +124,34 @@ func writeAddressAttrs(entry DNSLog, err error) []any {
 }
 
 func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
-	resp, firstUpstream, allCh, reason, err := r.resolveParallel(req)
+	qname := ""
+	qtype := ""
+	match := false
+	rule := config.DomainRule{}
+	ruleIndex := -1
+	if len(req.Question) > 0 {
+		q := req.Question[0]
+		qname = q.Name
+		qtype = dns.TypeToString[q.Qtype]
+		match, rule, ruleIndex = r.matchDomain(q.Name)
+	}
+
+	upstreamsList := r.upstreams
+	if match && ruleIndex >= 0 {
+		if ruleUpstreams, ok := r.ruleUpstreams[ruleIndex]; ok && len(ruleUpstreams) > 0 {
+			upstreamsList = ruleUpstreams
+		}
+	}
+
+	resp, firstUpstream, allCh, reason, err := r.resolveParallel(req, upstreamsList)
 	if err != nil {
 		m := new(dns.Msg)
 		m.SetRcode(req, dns.RcodeServerFailure)
 		_ = w.WriteMsg(m)
-		qname := ""
-		qtype := ""
-		if len(req.Question) > 0 {
-			qname = req.Question[0].Name
-			qtype = dns.TypeToString[req.Question[0].Qtype]
-		}
 		slog.Error("resolve error", resolveErrorAttrs(DNSLog{
 			Qname:     qname,
 			Qtype:     qtype,
-			Upstreams: r.upstreamSummary(),
+			Upstreams: upstreams.Labels(upstreamsList),
 			Reason:    reason,
 		}, err)...)
 		return
@@ -151,7 +169,6 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		Rcode:    dns.RcodeToString[resp.Rcode],
 		Answers:  len(resp.Answer),
 	})...)
-	match, rule := r.matchDomain(q.Name)
 	if !match {
 		return
 	}
@@ -245,8 +262,8 @@ func (r *Resolver) writeAddress(writer outputs.AddressWriter, listName, domain, 
 	}
 }
 
-func (r *Resolver) resolveParallel(req *dns.Msg) (*dns.Msg, string, <-chan *dns.Msg, string, error) {
-	resp, upstream, allCh, reason, ok := r.resolvePrimary(req)
+func (r *Resolver) resolveParallel(req *dns.Msg, upstreamsList []upstreams.Upstream) (*dns.Msg, string, <-chan *dns.Msg, string, error) {
+	resp, upstream, allCh, reason, ok := r.resolvePrimary(req, upstreamsList)
 	if ok {
 		return resp, upstream, allCh, "", nil
 	}
@@ -266,7 +283,7 @@ func (r *Resolver) resolveParallel(req *dns.Msg) (*dns.Msg, string, <-chan *dns.
 	return fbResp, fbUpstream, allCh, "", nil
 }
 
-func (r *Resolver) resolvePrimary(req *dns.Msg) (*dns.Msg, string, <-chan *dns.Msg, string, bool) {
+func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstream) (*dns.Msg, string, <-chan *dns.Msg, string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
 
 	type result struct {
@@ -276,10 +293,10 @@ func (r *Resolver) resolvePrimary(req *dns.Msg) (*dns.Msg, string, <-chan *dns.M
 		duration time.Duration
 	}
 
-	resCh := make(chan result, len(r.upstreams))
+	resCh := make(chan result, len(upstreamsList))
 
 	var wg sync.WaitGroup
-	for _, upstream := range r.upstreams {
+	for _, upstream := range upstreamsList {
 		upstream := upstream
 		wg.Add(1)
 		go func() {
@@ -337,7 +354,7 @@ func (r *Resolver) resolvePrimary(req *dns.Msg) (*dns.Msg, string, <-chan *dns.M
 		cancel()
 	}()
 
-	allCh := make(chan *dns.Msg, len(r.upstreams))
+	allCh := make(chan *dns.Msg, len(upstreamsList))
 	firstCh := make(chan result, 1)
 	reasonCh := make(chan string, 1)
 
@@ -348,7 +365,7 @@ func (r *Resolver) resolvePrimary(req *dns.Msg) (*dns.Msg, string, <-chan *dns.M
 
 	go func() {
 		firstSent := false
-		errs := make([]string, 0, len(r.upstreams))
+		errs := make([]string, 0, len(upstreamsList))
 		normalSeen := false
 		for res := range resCh {
 			if res.err != nil {
@@ -366,7 +383,7 @@ func (r *Resolver) resolvePrimary(req *dns.Msg) (*dns.Msg, string, <-chan *dns.M
 			}
 		}
 		if !firstSent {
-			if len(errs) == len(r.upstreams) && len(errs) > 0 {
+			if len(errs) == len(upstreamsList) && len(errs) > 0 {
 				reasonCh <- strings.Join(errs, "; ")
 			} else if !normalSeen {
 				reason := "no primary upstream returned address"
@@ -493,14 +510,6 @@ func (r *Resolver) resolveFallback(req *dns.Msg) (*dns.Msg, string, string, erro
 	return nil, "", reason, errors.New("all fallback upstreams failed")
 }
 
-func (r *Resolver) upstreamSummary() []string {
-	out := make([]string, 0, len(r.upstreams))
-	for _, upstream := range r.upstreams {
-		out = append(out, upstreams.Label(upstream))
-	}
-	return out
-}
-
 func fallbackCacheKey(q dns.Question) string {
 	return strings.ToLower(q.Name) + "|" + dns.TypeToString[q.Qtype] + "|" + dns.ClassToString[q.Qclass]
 }
@@ -570,36 +579,36 @@ func (r *Resolver) fallbackCacheSet(req *dns.Msg, resp *dns.Msg) {
 	r.fallbackMu.Unlock()
 }
 
-func (r *Resolver) matchDomain(qname string) (bool, config.DomainRule) {
+func (r *Resolver) matchDomain(qname string) (bool, config.DomainRule, int) {
 	if len(r.rules) == 0 {
-		return true, config.DomainRule{}
+		return true, config.DomainRule{}, -1
 	}
 	name := strings.TrimSuffix(strings.ToLower(qname), ".")
 	labels := strings.Split(name, ".")
 
-	for _, rule := range r.rules {
+	for i, rule := range r.rules {
 		if rule.Domain == "" {
 			continue
 		}
 		domain := rule.Domain
 		if name == domain {
-			return true, rule
+			return true, rule, i
 		}
 		if !rule.MatchSubDomains {
 			continue
 		}
 		if strings.HasSuffix(name, "."+domain) {
 			if rule.MaxDepth == nil {
-				return true, rule
+				return true, rule, i
 			}
 			domainLabels := strings.Split(domain, ".")
 			depth := len(labels) - len(domainLabels)
 			if depth <= *rule.MaxDepth {
-				return true, rule
+				return true, rule, i
 			}
 		}
 	}
-	return false, config.DomainRule{}
+	return false, config.DomainRule{}, -1
 }
 
 func normalizeOutputs(outputsList []string) []string {
