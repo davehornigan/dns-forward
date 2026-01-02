@@ -96,6 +96,7 @@ type RouterOSClient struct {
 	cache  map[string]string
 	loaded map[string]bool
 	mu     sync.Mutex
+	connMu sync.Mutex
 }
 
 type FileWriter struct {
@@ -264,7 +265,7 @@ func (c *RouterOSClient) ensureListCache(listName string) error {
 		return nil
 	}
 
-	reply, err := c.conn.Run("/ip/firewall/address-list/print", fmt.Sprintf("?list=%s", listName))
+	reply, err := c.run("/ip/firewall/address-list/print", fmt.Sprintf("?list=%s", listName))
 	if err != nil {
 		lower := strings.ToLower(err.Error())
 		if strings.Contains(lower, "no such item") {
@@ -344,7 +345,7 @@ func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *st
 	}
 	c.mu.Unlock()
 
-	reply, err := c.conn.RunArgs(args)
+	reply, err := c.runArgs(args)
 	if err != nil {
 		return err
 	}
@@ -365,7 +366,7 @@ func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *st
 func (c *RouterOSClient) updateAddressTTL(id, ttl string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, err := c.conn.RunArgs([]string{
+	_, err := c.runArgs([]string{
 		"/ip/firewall/address-list/set",
 		fmt.Sprintf("=.id=%s", id),
 		fmt.Sprintf("=timeout=%s", ttl),
@@ -408,6 +409,21 @@ func (c *RouterOSClient) startCacheRefresher(interval time.Duration) {
 			c.refreshAllLists()
 		}
 	}()
+}
+
+func (c *RouterOSClient) run(cmd string, args ...string) (*routeros.Reply, error) {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	runArgs := make([]string, 0, 1+len(args))
+	runArgs = append(runArgs, cmd)
+	runArgs = append(runArgs, args...)
+	return c.conn.Run(runArgs...)
+}
+
+func (c *RouterOSClient) runArgs(args []string) (*routeros.Reply, error) {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	return c.conn.RunArgs(args)
 }
 
 func (f *FileWriter) EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error {
