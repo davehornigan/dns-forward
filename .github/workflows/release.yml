@@ -10,6 +10,7 @@ on:
       - .gitignore
       - Makefile
       - .air.toml
+      - config.yaml.dist
   workflow_dispatch:
 
 permissions:

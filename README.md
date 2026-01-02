@@ -27,10 +27,11 @@ server:
 
 upstreams:
   - tls://dns.google
-  - https://dns.google/query
+  - https://dns.google/dns-query
 fallbackUpstreams:
   - tls://dns.quad9.net
   - https://dns.quad9.net/dns-query
+  - tcp://9.9.9.9
   - udp://1.1.1.1
 
 domains:

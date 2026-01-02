@@ -12,7 +12,7 @@ upstreams:
   - tls://dns.google
   - https://dns.google/dns-query
   - tls://one.one.one.one
-  - https://one.one.one.one
+  - https://one.one.one.one/dns-query
 fallbackUpstreams:
   - udp://1.1.1.1:53
   - tls://dns.quad9.net
