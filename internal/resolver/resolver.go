@@ -24,6 +24,7 @@ type DNSLog struct {
 	Upstreams []string
 	Rcode     string
 	Answers   int
+	Addresses []string
 	Reason    string
 	List      string
 	Domain    string
@@ -104,7 +105,7 @@ func upstreamResultAttrs(entry DNSLog, err error) []any {
 			"error", err,
 		}
 	}
-	return []any{
+	attrs := []any{
 		"qname", entry.Qname,
 		"qtype", entry.Qtype,
 		"upstream", entry.Upstream,
@@ -112,6 +113,10 @@ func upstreamResultAttrs(entry DNSLog, err error) []any {
 		"answers", entry.Answers,
 		"duration_ms", entry.Duration.Milliseconds(),
 	}
+	if len(entry.Addresses) > 0 {
+		attrs = append(attrs, "addresses", entry.Addresses)
+	}
+	return attrs
 }
 
 func writeAddressAttrs(entry DNSLog, err error) []any {
@@ -191,12 +196,12 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 				ipSet[ip] = true
 			}
 		}
-		if hostSeen && len(ipSet) > 0 && shouldWriteOutputs(ruleOutputs, true) {
-			ips := make([]string, 0, len(ipSet))
-			for ip := range ipSet {
-				ips = append(ips, ip)
-			}
-			sort.Strings(ips)
+		ips := make([]string, 0, len(ipSet))
+		for ip := range ipSet {
+			ips = append(ips, ip)
+		}
+		sort.Strings(ips)
+		if hostSeen && len(ips) > 0 && shouldWriteOutputs(ruleOutputs, true) {
 			ctx, cancel := context.WithTimeout(context.Background(), r.httpTimeout)
 			defer cancel()
 			for _, target := range r.outputs {
@@ -229,7 +234,7 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 			switch writer.OutputType() {
 			case outputs.OutputFile:
-				for ip := range ipSet {
+				for _, ip := range ips {
 					r.writeAddress(writer, effectiveList, domain, ip)
 				}
 			case outputs.OutputRouterOS:
@@ -240,11 +245,11 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 					}
 					break
 				}
-				for ip := range ipSet {
+				for _, ip := range ips {
 					r.writeAddress(writer, effectiveList, domain, ip)
 				}
 			default:
-				for ip := range ipSet {
+				for _, ip := range ips {
 					r.writeAddress(writer, effectiveList, domain, ip)
 				}
 			}
@@ -337,13 +342,18 @@ func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstre
 				}, err)...)
 				return
 			}
+			addresses := upstreams.ExtractIPs(resp.Answer)
+			if len(addresses) > 1 {
+				sort.Strings(addresses)
+			}
 			slog.Debug("upstream resolve", upstreamResultAttrs(DNSLog{
-				Qname:    qname,
-				Qtype:    qtype,
-				Upstream: upLabel,
-				Rcode:    dns.RcodeToString[resp.Rcode],
-				Answers:  len(resp.Answer),
-				Duration: rtt,
+				Qname:     qname,
+				Qtype:     qtype,
+				Upstream:  upLabel,
+				Rcode:     dns.RcodeToString[resp.Rcode],
+				Answers:   len(resp.Answer),
+				Duration:  rtt,
+				Addresses: addresses,
 			}, nil)...)
 		}()
 	}
@@ -478,13 +488,18 @@ func (r *Resolver) resolveFallback(req *dns.Msg) (*dns.Msg, string, string, erro
 				}, err)...)
 				return
 			}
+			addresses := upstreams.ExtractIPs(resp.Answer)
+			if len(addresses) > 1 {
+				sort.Strings(addresses)
+			}
 			slog.Debug("upstream resolve", upstreamResultAttrs(DNSLog{
-				Qname:    qname,
-				Qtype:    qtype,
-				Upstream: upLabel,
-				Rcode:    dns.RcodeToString[resp.Rcode],
-				Answers:  len(resp.Answer),
-				Duration: rtt,
+				Qname:     qname,
+				Qtype:     qtype,
+				Upstream:  upLabel,
+				Rcode:     dns.RcodeToString[resp.Rcode],
+				Answers:   len(resp.Answer),
+				Duration:  rtt,
+				Addresses: addresses,
 			}, nil)...)
 		}()
 	}
