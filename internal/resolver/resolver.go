@@ -342,6 +342,9 @@ func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstre
 				}, err)...)
 				return
 			}
+			if upstream.Kind == "udp" || upstream.Kind == "tcp" {
+				checkEDNS(req, resp, upLabel, qname)
+			}
 			addresses := upstreams.ExtractIPs(resp.Answer)
 			if len(addresses) > 1 {
 				sort.Strings(addresses)
@@ -488,6 +491,9 @@ func (r *Resolver) resolveFallback(req *dns.Msg) (*dns.Msg, string, string, erro
 				}, err)...)
 				return
 			}
+			if upstream.Kind == "udp" || upstream.Kind == "tcp" {
+				checkEDNS(req, resp, upLabel, qname)
+			}
 			addresses := upstreams.ExtractIPs(resp.Answer)
 			if len(addresses) > 1 {
 				sort.Strings(addresses)
@@ -540,6 +546,42 @@ func minAnswerTTL(resp *dns.Msg) uint32 {
 		}
 	}
 	return minTTL
+}
+
+func ednsCookie(msg *dns.Msg) (string, bool) {
+	if msg == nil {
+		return "", false
+	}
+	opt := msg.IsEdns0()
+	if opt == nil {
+		return "", false
+	}
+	for _, option := range opt.Option {
+		if cookie, ok := option.(*dns.EDNS0_COOKIE); ok {
+			return cookie.Cookie, true
+		}
+	}
+	return "", false
+}
+
+func checkEDNS(req *dns.Msg, resp *dns.Msg, upstreamLabel string, qname string) {
+	reqOpt := req.IsEdns0()
+	if reqOpt == nil {
+		return
+	}
+	respOpt := resp.IsEdns0()
+	if respOpt == nil {
+		slog.Warn("upstream missing EDNS response", "qname", qname, "upstream", upstreamLabel)
+		return
+	}
+	reqCookie, reqHasCookie := ednsCookie(req)
+	if !reqHasCookie {
+		return
+	}
+	respCookie, respHasCookie := ednsCookie(resp)
+	if !respHasCookie || respCookie != reqCookie {
+		slog.Warn("upstream EDNS cookie mismatch", "qname", qname, "upstream", upstreamLabel)
+	}
 }
 
 func (r *Resolver) fallbackCacheGet(req *dns.Msg) (*dns.Msg, bool) {
