@@ -21,6 +21,9 @@ server:
   dnsTimeout: 3s
   httpTimeout: 10s
   debug: false
+  excludeSubnets:
+    - 10.0.0.0/8
+    - 192.168.0.0/16
 
 upstreams:
   - tls://dns.google
@@ -74,6 +77,7 @@ Server:
 - `server.timeout` is the overall time budget for a DNS request.
 - `server.dnsTimeout` applies to upstream DNS queries.
 - `server.httpTimeout` applies to webhook and RouterOS API requests.
+- `server.excludeSubnets` drops resolved IPs within these CIDRs before writing to outputs.
 
 Upstreams:
 - DoH upstreams require a full path (e.g. `https://dns.google/query`).

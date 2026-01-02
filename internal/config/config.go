@@ -20,11 +20,12 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Debug       bool          `yaml:"debug"`
-	ListenAddr  string        `yaml:"listenAddr"`
-	Timeout     time.Duration `yaml:"timeout"`
-	DNSTimeout  time.Duration `yaml:"dnsTimeout"`
-	HTTPTimeout time.Duration `yaml:"httpTimeout"`
+	Debug          bool          `yaml:"debug"`
+	ListenAddr     string        `yaml:"listenAddr"`
+	Timeout        time.Duration `yaml:"timeout"`
+	DNSTimeout     time.Duration `yaml:"dnsTimeout"`
+	HTTPTimeout    time.Duration `yaml:"httpTimeout"`
+	ExcludeSubnets []string      `yaml:"excludeSubnets"`
 }
 
 type OutputConfig struct {

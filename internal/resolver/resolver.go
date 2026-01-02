@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -38,6 +39,7 @@ type Resolver struct {
 	rules             []config.DomainRule
 	ruleUpstreams     map[int][]upstreams.Upstream
 	outputs           []OutputTarget
+	excludeSubnets    []*net.IPNet
 	timeout           time.Duration
 	dnsTimeout        time.Duration
 	httpTimeout       time.Duration
@@ -57,7 +59,7 @@ type OutputTarget struct {
 	Webhook *outputs.WebhookSender
 }
 
-func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, rules []config.DomainRule, ruleUpstreams map[int][]upstreams.Upstream, outputsList []OutputTarget, timeout, dnsTimeout, httpTimeout time.Duration, dohHTTP *http.Client) *Resolver {
+func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, rules []config.DomainRule, ruleUpstreams map[int][]upstreams.Upstream, outputsList []OutputTarget, excludeSubnets []*net.IPNet, timeout, dnsTimeout, httpTimeout time.Duration, dohHTTP *http.Client) *Resolver {
 	if ruleUpstreams == nil {
 		ruleUpstreams = make(map[int][]upstreams.Upstream)
 	}
@@ -67,6 +69,7 @@ func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, 
 		rules:             rules,
 		ruleUpstreams:     ruleUpstreams,
 		outputs:           outputsList,
+		excludeSubnets:    excludeSubnets,
 		timeout:           timeout,
 		dnsTimeout:        dnsTimeout,
 		httpTimeout:       httpTimeout,
@@ -201,6 +204,7 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			ips = append(ips, ip)
 		}
 		sort.Strings(ips)
+		ips = filterExcludedIPs(ips, r.excludeSubnets)
 		if hostSeen && len(ips) > 0 && shouldWriteOutputs(ruleOutputs, true) {
 			ctx, cancel := context.WithTimeout(context.Background(), r.httpTimeout)
 			defer cancel()
@@ -546,6 +550,31 @@ func minAnswerTTL(resp *dns.Msg) uint32 {
 		}
 	}
 	return minTTL
+}
+
+func filterExcludedIPs(ips []string, subnets []*net.IPNet) []string {
+	if len(ips) == 0 || len(subnets) == 0 {
+		return ips
+	}
+	filtered := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			filtered = append(filtered, ip)
+			continue
+		}
+		excluded := false
+		for _, subnet := range subnets {
+			if subnet != nil && subnet.Contains(parsed) {
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
+			filtered = append(filtered, ip)
+		}
+	}
+	return filtered
 }
 
 func ednsCookie(msg *dns.Msg) (string, bool) {

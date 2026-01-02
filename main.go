@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -122,6 +123,11 @@ func main() {
 	if httpTimeout == 0 {
 		httpTimeout = timeout
 	}
+	excludeSubnets, err := parseExcludeSubnets(cfg.Server.ExcludeSubnets)
+	if err != nil {
+		slog.Error("parse exclude subnets", "error", err)
+		os.Exit(1)
+	}
 
 	var outputTargets []resolver.OutputTarget
 	outputIDs := make(map[string]struct{})
@@ -232,7 +238,7 @@ func main() {
 		"outputs", outputSummaries,
 	)
 
-	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, ruleUpstreams, outputTargets, timeout, dnsTimeout, httpTimeout, dohHTTP)
+	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, ruleUpstreams, outputTargets, excludeSubnets, timeout, dnsTimeout, httpTimeout, dohHTTP)
 
 	addr := cfg.Server.ListenAddr
 	if addr == "" {
@@ -255,6 +261,25 @@ func main() {
 		slog.Error("tcp server", "error", err)
 		os.Exit(1)
 	}
+}
+
+func parseExcludeSubnets(subnets []string) ([]*net.IPNet, error) {
+	if len(subnets) == 0 {
+		return nil, nil
+	}
+	out := make([]*net.IPNet, 0, len(subnets))
+	for _, entry := range subnets {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		_, parsed, err := net.ParseCIDR(entry)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, parsed)
+	}
+	return out, nil
 }
 
 func upstreamKey(upstream upstreams.Upstream) string {
