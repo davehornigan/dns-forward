@@ -153,7 +153,7 @@ func main() {
 				slog.Error("routeros", "error", err)
 				os.Exit(1)
 			}
-			outputTargets = append(outputTargets, resolver.OutputTarget{ID: outputID, Writer: ros})
+			outputTargets = append(outputTargets, resolver.OutputTarget{ID: outputID, Mode: output.Mode, Writer: ros})
 		case "file":
 			if output.File == nil {
 				slog.Error("file config missing")
@@ -165,7 +165,7 @@ func main() {
 				slog.Error("file writer", "error", err)
 				os.Exit(1)
 			}
-			outputTargets = append(outputTargets, resolver.OutputTarget{ID: outputID, Writer: fileWriter})
+			outputTargets = append(outputTargets, resolver.OutputTarget{ID: outputID, Mode: output.Mode, Writer: fileWriter})
 		case "webhook":
 			if output.Webhook == nil {
 				slog.Error("webhook config missing")
@@ -177,7 +177,7 @@ func main() {
 				slog.Error("webhook", "error", err)
 				os.Exit(1)
 			}
-			outputTargets = append(outputTargets, resolver.OutputTarget{ID: outputID, Webhook: sender})
+			outputTargets = append(outputTargets, resolver.OutputTarget{ID: outputID, Mode: output.Mode, Webhook: sender})
 		default:
 			slog.Error("unsupported output type", "type", output.Type)
 			os.Exit(1)

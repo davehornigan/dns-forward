@@ -55,6 +55,7 @@ type cachedResponse struct {
 
 type OutputTarget struct {
 	ID      string
+	Mode    string
 	Writer  outputs.AddressWriter
 	Webhook *outputs.WebhookSender
 }
@@ -151,7 +152,8 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		}
 	}
 
-	resp, firstUpstream, allCh, reason, err := r.resolveParallel(req, upstreamsList)
+	disableFallback := match && rule.DisableFallback
+	resp, firstUpstream, allCh, reason, err := r.resolveParallel(req, upstreamsList, disableFallback)
 	if err != nil {
 		m := new(dns.Msg)
 		m.SetRcode(req, dns.RcodeServerFailure)
@@ -212,7 +214,7 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 				if target.Webhook == nil {
 					continue
 				}
-				if !shouldWriteTarget(ruleOutputs, target.ID) {
+				if !shouldWriteTarget(ruleOutputs, target) {
 					continue
 				}
 				if err := target.Webhook.Send(ctx, ruleList, domain, ips); err != nil {
@@ -224,7 +226,7 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			if target.Writer == nil {
 				continue
 			}
-			if !shouldWriteTarget(ruleOutputs, target.ID) {
+			if !shouldWriteTarget(ruleOutputs, target) {
 				continue
 			}
 			writer := target.Writer
@@ -271,10 +273,16 @@ func (r *Resolver) writeAddress(writer outputs.AddressWriter, listName, domain, 
 	}
 }
 
-func (r *Resolver) resolveParallel(req *dns.Msg, upstreamsList []upstreams.Upstream) (*dns.Msg, string, <-chan *dns.Msg, string, error) {
+func (r *Resolver) resolveParallel(req *dns.Msg, upstreamsList []upstreams.Upstream, disableFallback bool) (*dns.Msg, string, <-chan *dns.Msg, string, error) {
 	resp, upstream, allCh, reason, ok := r.resolvePrimary(req, upstreamsList)
 	if ok {
 		return resp, upstream, allCh, "", nil
+	}
+	if disableFallback {
+		if reason == "" {
+			reason = "all upstreams failed"
+		}
+		return nil, "", allCh, reason, errors.New("all upstreams failed")
 	}
 	if len(r.fallbackUpstreams) == 0 {
 		return nil, "", allCh, reason, errors.New("all upstreams failed")
@@ -719,15 +727,15 @@ func shouldWriteOutputs(outputsList []string, hasAddresses bool) bool {
 	return len(outputsList) > 0 && hasAddresses
 }
 
-func shouldWriteTarget(outputsList []string, id string) bool {
+func shouldWriteTarget(outputsList []string, target OutputTarget) bool {
 	if outputsList == nil {
-		return true
+		return target.Mode != "passive"
 	}
 	if len(outputsList) == 0 {
 		return false
 	}
 	for _, allowed := range outputsList {
-		if allowed == id {
+		if allowed == target.ID {
 			return true
 		}
 	}

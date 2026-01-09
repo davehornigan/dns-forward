@@ -31,12 +31,14 @@ domains:
       - https://one.one.one.one/dns-query
   - domain: example.com
     matchSubDomains: false
+    disableFallback: false
     upstreamsBlacklist:
       - https://dns.google/dns-query
 
 outputs:
   - type: rosApiAddressList
     id: ros_main
+    mode: active
     host: 10.0.0.1
     port: ~
     useTLS: false
@@ -50,11 +52,13 @@ outputs:
     reconnectionAttempts: 3
   - type: file
     id: file_main
+    mode: active
     path: ./data
     listName: my_resolved_domains
     format: csv
   - type: webhook
     id: webhook_main
+    mode: active
     method: POST
     url: https://example.com/dns-webhook
     listName: my_resolved_domains

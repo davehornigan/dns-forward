@@ -41,6 +41,7 @@ domains:
   - domain: openai.com
     matchSubDomains: true
     listName: openai
+    disableFallback: false
     upstreamsOverride:
       - tls://one.one.one.one
       - https://one.one.one.one/dns-query
@@ -52,6 +53,7 @@ domains:
 outputs:
   - type: rosApiAddressList
     id: ros_main
+    mode: active
     host: 10.0.0.1
     port: 8728
     useTLS: false
@@ -65,11 +67,13 @@ outputs:
     reconnectionAttempts: 3
   - type: file
     id: file_main
+    mode: active
     path: ./data
     listName: my_resolved_domains
     format: csv
   - type: webhook
     id: webhook_main
+    mode: active
     method: POST
     url: https://example.com/dns-webhook
     listName: my_resolved_domains
@@ -93,9 +97,11 @@ Domains:
 - `domains[].outputs` controls which outputs are used by ID. If omitted or null, all outputs are used. If empty, nothing is written.
 - `domains[].upstreamsOverride` overrides the primary upstream list for matching domains; if omitted, global `upstreams` are used. Fallback upstreams are always shared.
 - `domains[].upstreamsBlacklist` excludes entries from the primary upstream list for matching domains. Only one of `upstreamsOverride` or `upstreamsBlacklist` may be set.
+- `domains[].disableFallback` disables fallback upstreams for matching domains.
 
 Outputs:
 - All outputs are optional, but at least one must be configured. Every output requires a unique `id`.
+- `outputs[].mode` can be `active` (default) or `passive`. Passive outputs are used only when explicitly listed in `domains[].outputs`.
 - `rosApiAddressList` supports `host` with optional scheme/port; only `http`/`https` are supported. If omitted, `http` is assumed. When `useTLS` or `port` are omitted, they inherit from the host URL.
 - `rosApiAddressList.connectionAttempts` controls initial connection retries (default `3`).
 - `rosApiAddressList.reconnectionAttempts` controls reconnect retries after a connection failure; if omitted, it inherits `connectionAttempts`.

@@ -30,6 +30,7 @@ type ServerConfig struct {
 
 type OutputConfig struct {
 	Type              string                           `yaml:"type"`
+	Mode              string                           `yaml:"mode"`
 	RosApiAddressList *outputs.RosApiAddressListConfig `yaml:"-"`
 	File              *outputs.FileOutputConfig        `yaml:"-"`
 	Webhook           *outputs.WebhookConfig           `yaml:"-"`
@@ -41,6 +42,7 @@ type DomainRule struct {
 	MaxDepth           *int     `yaml:"maxDepth"`
 	ListName           string   `yaml:"listName"`
 	Outputs            []string `yaml:"outputs"`
+	DisableFallback    bool     `yaml:"disableFallback"`
 	UpstreamsOverride  []string `yaml:"upstreamsOverride"`
 	UpstreamsBlacklist []string `yaml:"upstreamsBlacklist"`
 }
@@ -48,11 +50,21 @@ type DomainRule struct {
 func (o *OutputConfig) UnmarshalYAML(node *yaml.Node) error {
 	var typeHolder struct {
 		Type string `yaml:"type"`
+		Mode string `yaml:"mode"`
 	}
 	if err := node.Decode(&typeHolder); err != nil {
 		return err
 	}
 	o.Type = strings.TrimSpace(typeHolder.Type)
+	o.Mode = strings.ToLower(strings.TrimSpace(typeHolder.Mode))
+	if o.Mode == "" {
+		o.Mode = "active"
+	}
+	switch o.Mode {
+	case "active", "passive":
+	default:
+		return fmt.Errorf("unsupported output mode %q", o.Mode)
+	}
 	switch o.Type {
 	case "rosApiAddressList":
 		var cfg outputs.RosApiAddressListConfig

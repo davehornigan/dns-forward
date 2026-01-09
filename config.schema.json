@@ -44,6 +44,7 @@
         "maxDepth": { "type": ["integer", "null"], "minimum": 0 },
         "listName": { "type": ["string", "null"] },
         "outputs": { "type": ["array", "null"], "items": { "type": "string" } },
+        "disableFallback": { "type": ["boolean", "null"] },
         "upstreamsOverride": { "type": ["array", "null"], "items": { "type": "string" } },
         "upstreamsBlacklist": { "type": ["array", "null"], "items": { "type": "string" } }
       },
@@ -62,6 +63,7 @@
       "additionalProperties": false,
       "properties": {
         "type": { "const": "rosApiAddressList" },
+        "mode": { "type": ["string", "null"], "enum": ["active", "passive", null] },
         "id": { "type": "string" },
         "host": { "type": "string" },
         "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
@@ -82,6 +84,7 @@
       "additionalProperties": false,
       "properties": {
         "type": { "const": "file" },
+        "mode": { "type": ["string", "null"], "enum": ["active", "passive", null] },
         "id": { "type": "string" },
         "path": { "type": "string" },
         "listName": { "type": "string" },
@@ -94,6 +97,7 @@
       "additionalProperties": false,
       "properties": {
         "type": { "const": "webhook" },
+        "mode": { "type": ["string", "null"], "enum": ["active", "passive", null] },
         "id": { "type": "string" },
         "method": { "type": ["string", "null"] },
         "url": { "type": "string" },
