@@ -30,7 +30,10 @@ const (
 	OutputRouterOS = "routeros"
 )
 
-const defaultRouterOSCacheRefresh = 5 * time.Minute
+const (
+	defaultRouterOSCacheRefresh     = 5 * time.Minute
+	defaultRouterOSConnectionTrials = 3
+)
 
 type FileOutputConfig struct {
 	ID       string `yaml:"id"`
@@ -40,12 +43,14 @@ type FileOutputConfig struct {
 }
 
 type RosApiAddressListConfig struct {
-	Access     RosApiAccessConfig `yaml:"-"`
-	ID         string             `yaml:"id"`
-	ListName   string             `yaml:"listName"`
-	TTL        *string            `yaml:"ttl"`
-	UpdateTTL  *bool              `yaml:"updateTTL"`
-	RecordType string             `yaml:"recordType"`
+	Access                RosApiAccessConfig `yaml:"-"`
+	ID                    string             `yaml:"id"`
+	ListName              string             `yaml:"listName"`
+	TTL                   *string            `yaml:"ttl"`
+	UpdateTTL             *bool              `yaml:"updateTTL"`
+	RecordType            string             `yaml:"recordType"`
+	ConnectionAttempts    int                `yaml:"connectionAttempts"`
+	ReconnectionAttempts  *int               `yaml:"reconnectionAttempts"`
 }
 
 func (c *RosApiAddressListConfig) UnmarshalYAML(node *yaml.Node) error {
@@ -59,6 +64,8 @@ func (c *RosApiAddressListConfig) UnmarshalYAML(node *yaml.Node) error {
 	c.UpdateTTL = cfg.UpdateTTL
 	c.RecordType = cfg.RecordType
 	c.ID = cfg.ID
+	c.ConnectionAttempts = cfg.ConnectionAttempts
+	c.ReconnectionAttempts = cfg.ReconnectionAttempts
 
 	var access RosApiAccessConfig
 	if err := node.Decode(&access); err != nil {
@@ -91,12 +98,17 @@ type AddressWriter interface {
 }
 
 type RouterOSClient struct {
-	cfg    RosApiAddressListConfig
-	conn   *routeros.Client
-	cache  map[string]string
-	loaded map[string]bool
-	mu     sync.Mutex
-	connMu sync.Mutex
+	cfg                   RosApiAddressListConfig
+	conn                  *routeros.Client
+	cache                 map[string]string
+	loaded                map[string]bool
+	mu                    sync.Mutex
+	connMu                sync.Mutex
+	address               string
+	useTLS                bool
+	timeout               time.Duration
+	connectionAttempts    int
+	reconnectionAttempts  int
 }
 
 type FileWriter struct {
@@ -154,17 +166,44 @@ func NewRouterOSClient(cfg RosApiAddressListConfig, timeout time.Duration) (*Rou
 	}
 
 	address := FormatRouterOSAddress(cfg.Access)
+	useTLS := effectiveUseTLS(cfg.Access)
+	connectionAttempts := cfg.ConnectionAttempts
+	if connectionAttempts <= 0 {
+		connectionAttempts = defaultRouterOSConnectionTrials
+	}
+	reconnectionAttempts := connectionAttempts
+	if cfg.ReconnectionAttempts != nil {
+		reconnectionAttempts = *cfg.ReconnectionAttempts
+		if reconnectionAttempts < 0 {
+			reconnectionAttempts = 0
+		}
+	}
 
-	conn, err := dialRouterOS(address, cfg.Access.Username, cfg.Access.Password, effectiveUseTLS(cfg.Access), timeout)
+	var (
+		conn *routeros.Client
+		err  error
+	)
+	for attempt := 1; attempt <= connectionAttempts; attempt++ {
+		conn, err = dialRouterOS(address, cfg.Access.Username, cfg.Access.Password, useTLS, timeout)
+		if err == nil {
+			break
+		}
+		slog.Warn("routeros connect failed", "attempt", attempt, "max_attempts", connectionAttempts, "error", err)
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	client := &RouterOSClient{
-		cfg:    cfg,
-		conn:   conn,
-		cache:  make(map[string]string),
-		loaded: make(map[string]bool),
+		cfg:                  cfg,
+		conn:                 conn,
+		cache:                make(map[string]string),
+		loaded:               make(map[string]bool),
+		address:              address,
+		useTLS:               useTLS,
+		timeout:              timeout,
+		connectionAttempts:   connectionAttempts,
+		reconnectionAttempts: reconnectionAttempts,
 	}
 	if err := client.ensureListCache(cfg.ListName); err != nil {
 		return nil, err
@@ -269,10 +308,6 @@ func (c *RouterOSClient) ensureListCache(listName string) error {
 	if err != nil {
 		lower := strings.ToLower(err.Error())
 		if strings.Contains(lower, "no such item") {
-			c.loaded[listName] = true
-			return nil
-		}
-		if strings.Contains(lower, "routeros reply word: !empty") {
 			c.loaded[listName] = true
 			return nil
 		}
@@ -417,13 +452,80 @@ func (c *RouterOSClient) run(cmd string, args ...string) (*routeros.Reply, error
 	runArgs := make([]string, 0, 1+len(args))
 	runArgs = append(runArgs, cmd)
 	runArgs = append(runArgs, args...)
-	return c.conn.Run(runArgs...)
+	reply, err := c.conn.Run(runArgs...)
+	if err != nil && isEmptyReplyErr(err) {
+		return &routeros.Reply{}, nil
+	}
+	if err == nil || c.reconnectionAttempts <= 0 {
+		return reply, err
+	}
+	lastErr := err
+	for attempt := 1; attempt <= c.reconnectionAttempts; attempt++ {
+		if err := c.reconnectLocked(); err != nil {
+			slog.Warn("routeros reconnect failed", "attempt", attempt, "max_attempts", c.reconnectionAttempts, "error", err)
+			lastErr = err
+			continue
+		}
+		reply, err = c.conn.Run(runArgs...)
+		if err != nil && isEmptyReplyErr(err) {
+			return &routeros.Reply{}, nil
+		}
+		if err == nil {
+			return reply, nil
+		}
+		slog.Warn("routeros command failed after reconnect", "attempt", attempt, "max_attempts", c.reconnectionAttempts, "error", err)
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 func (c *RouterOSClient) runArgs(args []string) (*routeros.Reply, error) {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
-	return c.conn.RunArgs(args)
+	reply, err := c.conn.RunArgs(args)
+	if err != nil && isEmptyReplyErr(err) {
+		return &routeros.Reply{}, nil
+	}
+	if err == nil || c.reconnectionAttempts <= 0 {
+		return reply, err
+	}
+	lastErr := err
+	for attempt := 1; attempt <= c.reconnectionAttempts; attempt++ {
+		if err := c.reconnectLocked(); err != nil {
+			slog.Warn("routeros reconnect failed", "attempt", attempt, "max_attempts", c.reconnectionAttempts, "error", err)
+			lastErr = err
+			continue
+		}
+		reply, err = c.conn.RunArgs(args)
+		if err != nil && isEmptyReplyErr(err) {
+			return &routeros.Reply{}, nil
+		}
+		if err == nil {
+			return reply, nil
+		}
+		slog.Warn("routeros command failed after reconnect", "attempt", attempt, "max_attempts", c.reconnectionAttempts, "error", err)
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (c *RouterOSClient) reconnectLocked() error {
+	conn, err := dialRouterOS(c.address, c.cfg.Access.Username, c.cfg.Access.Password, c.useTLS, c.timeout)
+	if err != nil {
+		return err
+	}
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	c.conn = conn
+	return nil
+}
+
+func isEmptyReplyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "routeros reply word: !empty")
 }
 
 func (f *FileWriter) EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error {

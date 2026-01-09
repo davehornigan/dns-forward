@@ -7,4 +7,4 @@ run:
 	go run . -config config.yaml
 
 air:
-	go run -mod=mod github.com/air-verse/air -c .air.toml
+	go run github.com/air-verse/air@latest -c .air.toml

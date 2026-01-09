@@ -46,6 +46,8 @@ outputs:
     ttl: ~
     updateTTL: true
     recordType: ip
+    connectionAttempts: 3
+    reconnectionAttempts: 3
   - type: file
     id: file_main
     path: ./data

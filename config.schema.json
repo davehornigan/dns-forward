@@ -71,7 +71,9 @@
         "listName": { "type": "string" },
         "ttl": { "type": ["string", "null"] },
         "updateTTL": { "type": ["boolean", "null"] },
-        "recordType": { "type": "string", "enum": ["ip", "host"] }
+        "recordType": { "type": "string", "enum": ["ip", "host"] },
+        "connectionAttempts": { "type": ["integer", "null"], "minimum": 1 },
+        "reconnectionAttempts": { "type": ["integer", "null"], "minimum": 1 }
       },
       "required": ["type", "id", "host", "username", "password", "listName", "recordType"]
     },

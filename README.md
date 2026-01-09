@@ -61,6 +61,8 @@ outputs:
     ttl: ~
     updateTTL: true
     recordType: ip
+    connectionAttempts: 3
+    reconnectionAttempts: 3
   - type: file
     id: file_main
     path: ./data
@@ -95,6 +97,8 @@ Domains:
 Outputs:
 - All outputs are optional, but at least one must be configured. Every output requires a unique `id`.
 - `rosApiAddressList` supports `host` with optional scheme/port; only `http`/`https` are supported. If omitted, `http` is assumed. When `useTLS` or `port` are omitted, they inherit from the host URL.
+- `rosApiAddressList.connectionAttempts` controls initial connection retries (default `3`).
+- `rosApiAddressList.reconnectionAttempts` controls reconnect retries after a connection failure; if omitted, it inherits `connectionAttempts`.
 - File output `format` can be `csv` (default), `ipset`, or `nftset`. CSV writes `domain,ip` rows to `<path>/<listName>.csv`. `ipset` and `nftset` write dnsmasq rules to `<path>/<listName>.conf`.
 - `ipset` example: `ipset=/showip.net/LIST_NAME`
 - `nftset` example: `nftset=/showip.net/4#inet#fw4#LIST_NAME`
