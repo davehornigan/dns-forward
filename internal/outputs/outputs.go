@@ -101,7 +101,8 @@ type RouterOSClient struct {
 	cfg                   RosApiAddressListConfig
 	conn                  *routeros.Client
 	cache                 map[string]string
-	loaded                map[string]bool
+	pending               map[string]bool
+	listNames             map[string]bool
 	mu                    sync.Mutex
 	connMu                sync.Mutex
 	address               string
@@ -198,15 +199,12 @@ func NewRouterOSClient(cfg RosApiAddressListConfig, timeout time.Duration) (*Rou
 		cfg:                  cfg,
 		conn:                 conn,
 		cache:                make(map[string]string),
-		loaded:               make(map[string]bool),
+		pending:              make(map[string]bool),
 		address:              address,
 		useTLS:               useTLS,
 		timeout:              timeout,
 		connectionAttempts:   connectionAttempts,
 		reconnectionAttempts: reconnectionAttempts,
-	}
-	if err := client.ensureListCache(cfg.ListName); err != nil {
-		return nil, err
 	}
 	client.startCacheRefresher(defaultRouterOSCacheRefresh)
 	return client, nil
@@ -296,40 +294,30 @@ func FormatRouterOSAddress(cfg RosApiAccessConfig) string {
 	return net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", port))
 }
 
-func (c *RouterOSClient) ensureListCache(listName string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.loaded[listName] {
-		return nil
+func (c *RouterOSClient) findAddressID(listName, address string) (string, error) {
+	args := []string{
+		"/ip/firewall/address-list/print",
+		fmt.Sprintf("?list=%s", listName),
+		fmt.Sprintf("?address=%s", address),
+		"=.proplist=.id,address",
 	}
-
-	reply, err := c.run("/ip/firewall/address-list/print", fmt.Sprintf("?list=%s", listName))
+	reply, err := c.runArgs(args)
 	if err != nil {
 		lower := strings.ToLower(err.Error())
 		if strings.Contains(lower, "no such item") {
-			c.loaded[listName] = true
-			return nil
+			return "", nil
 		}
-		return err
+		return "", err
 	}
 	for _, re := range reply.Re {
-		id := re.Map[".id"]
-		address := re.Map["address"]
-		if address != "" && id != "" {
-			key := fmt.Sprintf("%s|%s", listName, address)
-			c.cache[key] = id
+		if id := re.Map[".id"]; id != "" {
+			return id, nil
 		}
 	}
-	c.loaded[listName] = true
-	return nil
+	return "", nil
 }
 
 func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error {
-	if err := c.ensureListCache(listName); err != nil {
-		return err
-	}
-
 	key := fmt.Sprintf("%s|%s", listName, address)
 	effectiveTTL := ""
 	if ttl != nil && strings.TrimSpace(*ttl) != "" {
@@ -345,23 +333,32 @@ func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *st
 			return nil
 		}
 		return c.updateAddressTTL(id, effectiveTTL)
-	} else if ok && id == "" {
+	}
+	if c.pending[key] {
 		c.mu.Unlock()
-		if err := c.refreshListCache(listName); err != nil {
-			return err
-		}
+		return nil
+	}
+	c.pending[key] = true
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.pending, key)
+		c.mu.Unlock()
+	}()
+
+	id, err := c.findAddressID(listName, address)
+	if err != nil {
+		return err
+	}
+	if id != "" {
+		c.mu.Lock()
+		c.cache[key] = id
+		c.mu.Unlock()
 		if effectiveTTL == "" || !shouldUpdateTTL(c.cfg.UpdateTTL, updateTTL) {
 			return nil
 		}
-		c.mu.Lock()
-		id = c.cache[key]
-		c.mu.Unlock()
-		if id != "" {
-			return c.updateAddressTTL(id, effectiveTTL)
-		}
-		return nil
+		return c.updateAddressTTL(id, effectiveTTL)
 	}
-	c.mu.Unlock()
 
 	args := []string{
 		"/ip/firewall/address-list/add",
@@ -372,13 +369,6 @@ func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *st
 	if effectiveTTL != "" {
 		args = append(args, fmt.Sprintf("=timeout=%s", effectiveTTL))
 	}
-
-	c.mu.Lock()
-	if _, ok := c.cache[key]; ok {
-		c.mu.Unlock()
-		return nil
-	}
-	c.mu.Unlock()
 
 	reply, err := c.runArgs(args)
 	if err != nil {
@@ -392,8 +382,14 @@ func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *st
 			return nil
 		}
 	}
-	if err := c.refreshListCache(listName); err != nil {
+	id, err = c.findAddressID(listName, address)
+	if err != nil {
 		return err
+	}
+	if id != "" {
+		c.mu.Lock()
+		c.cache[key] = id
+		c.mu.Unlock()
 	}
 	return nil
 }
@@ -409,27 +405,34 @@ func (c *RouterOSClient) updateAddressTTL(id, ttl string) error {
 	return err
 }
 
-func (c *RouterOSClient) refreshListCache(listName string) error {
-	c.mu.Lock()
-	c.loaded[listName] = false
-	c.mu.Unlock()
-	return c.ensureListCache(listName)
-}
-
 func (c *RouterOSClient) refreshAllLists() {
 	c.mu.Lock()
-	listNames := make([]string, 0, len(c.loaded))
-	for listName, loaded := range c.loaded {
-		if loaded {
-			listNames = append(listNames, listName)
+	keys := make([]string, 0, len(c.cache))
+	for key := range c.cache {
+		if c.pending[key] {
+			continue
 		}
+		keys = append(keys, key)
 	}
 	c.mu.Unlock()
 
-	for _, listName := range listNames {
-		if err := c.refreshListCache(listName); err != nil {
-			slog.Error("routeros refresh list cache", "list", listName, "error", err)
+	for _, key := range keys {
+		listName, address, ok := splitCacheKey(key)
+		if !ok {
+			continue
 		}
+		id, err := c.findAddressID(listName, address)
+		if err != nil {
+			slog.Warn("routeros refresh cache failed", "list", listName, "address", address, "error", err)
+			continue
+		}
+		c.mu.Lock()
+		if id == "" {
+			delete(c.cache, key)
+		} else {
+			c.cache[key] = id
+		}
+		c.mu.Unlock()
 	}
 }
 
@@ -526,6 +529,14 @@ func isEmptyReplyErr(err error) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "routeros reply word: !empty")
+}
+
+func splitCacheKey(key string) (string, string, bool) {
+	sep := strings.Index(key, "|")
+	if sep <= 0 || sep == len(key)-1 {
+		return "", "", false
+	}
+	return key[:sep], key[sep+1:], true
 }
 
 func (f *FileWriter) EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error {
