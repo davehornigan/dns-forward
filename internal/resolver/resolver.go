@@ -440,14 +440,32 @@ func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstre
 		}
 		return nil, "", allCh, reason, false
 	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			select {
+			case res, ok := <-firstCh:
+				if ok {
+					return res.resp, res.upstream, allCh, "", true
+				}
+			default:
+			}
+			return nil, "", allCh, "timeout", false
+		}
 		select {
 		case res, ok := <-firstCh:
 			if ok {
 				return res.resp, res.upstream, allCh, "", true
 			}
-		default:
+			reason := "all upstreams failed"
+			if msg, ok := <-reasonCh; ok && msg != "" {
+				reason = msg
+			}
+			return nil, "", allCh, reason, false
+		case reason, ok := <-reasonCh:
+			if ok && reason != "" {
+				return nil, "", allCh, reason, false
+			}
+			return nil, "", allCh, "all upstreams failed", false
 		}
-		return nil, "", allCh, "timeout", false
 	case reason, ok := <-reasonCh:
 		if ok && reason != "" {
 			return nil, "", allCh, reason, false
