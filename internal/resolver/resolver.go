@@ -440,6 +440,13 @@ func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstre
 		}
 		return nil, "", allCh, reason, false
 	case <-ctx.Done():
+		select {
+		case res, ok := <-firstCh:
+			if ok {
+				return res.resp, res.upstream, allCh, "", true
+			}
+		default:
+		}
 		return nil, "", allCh, "timeout", false
 	case reason, ok := <-reasonCh:
 		if ok && reason != "" {
