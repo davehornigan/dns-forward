@@ -274,7 +274,7 @@ func (r *Resolver) writeAddress(writer outputs.AddressWriter, listName, domain, 
 }
 
 func (r *Resolver) resolveParallel(req *dns.Msg, upstreamsList []upstreams.Upstream, disableFallback bool) (*dns.Msg, string, <-chan *dns.Msg, string, error) {
-	resp, upstream, allCh, reason, ok := r.resolvePrimary(req, upstreamsList)
+	resp, upstream, allCh, reason, ok := r.resolvePrimary(req, upstreamsList, disableFallback)
 	if ok {
 		return resp, upstream, allCh, "", nil
 	}
@@ -300,7 +300,7 @@ func (r *Resolver) resolveParallel(req *dns.Msg, upstreamsList []upstreams.Upstr
 	return fbResp, fbUpstream, allCh, "", nil
 }
 
-func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstream) (*dns.Msg, string, <-chan *dns.Msg, string, bool) {
+func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstream, disableFallback bool) (*dns.Msg, string, <-chan *dns.Msg, string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
 
 	type result struct {
@@ -311,6 +311,10 @@ func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstre
 	}
 
 	resCh := make(chan result, len(upstreamsList))
+	dnsTimeout := r.dnsTimeout
+	if disableFallback && r.timeout > 0 {
+		dnsTimeout = r.timeout
+	}
 
 	var wg sync.WaitGroup
 	for _, upstream := range upstreamsList {
@@ -328,13 +332,13 @@ func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstre
 			}
 			start := time.Now()
 			var rtt time.Duration
-			reqCtx, cancel := context.WithTimeout(ctx, r.dnsTimeout)
+			reqCtx, cancel := context.WithTimeout(ctx, dnsTimeout)
 			defer cancel()
 			switch upstream.Kind {
 			case "udp", "tcp":
-				resp, rtt, err = upstreams.ExchangeDNS(reqCtx, upstream.Kind, upstream.Address, req, r.dnsTimeout)
+				resp, rtt, err = upstreams.ExchangeDNS(reqCtx, upstream.Kind, upstream.Address, req, dnsTimeout)
 			case "dot":
-				resp, rtt, err = upstreams.ExchangeDoT(reqCtx, upstream, req, r.dnsTimeout)
+				resp, rtt, err = upstreams.ExchangeDoT(reqCtx, upstream, req, dnsTimeout)
 			case "doh":
 				resp, rtt, err = upstreams.ExchangeDoH(reqCtx, r.dohHTTP, upstream.URL, req)
 			default:
