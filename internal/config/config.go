@@ -29,11 +29,12 @@ type ServerConfig struct {
 }
 
 type OutputConfig struct {
-	Type              string                           `yaml:"type"`
-	Mode              string                           `yaml:"mode"`
-	RosApiAddressList *outputs.RosApiAddressListConfig `yaml:"-"`
-	File              *outputs.FileOutputConfig        `yaml:"-"`
-	Webhook           *outputs.WebhookConfig           `yaml:"-"`
+	Type                  string                               `yaml:"type"`
+	Mode                  string                               `yaml:"mode"`
+	RosApiAddressList     *outputs.RosApiAddressListConfig     `yaml:"-"`
+	RosRestApiAddressList *outputs.RosRestApiAddressListConfig `yaml:"-"`
+	File                  *outputs.FileOutputConfig            `yaml:"-"`
+	Webhook               *outputs.WebhookConfig               `yaml:"-"`
 }
 
 type DomainRule struct {
@@ -72,6 +73,12 @@ func (o *OutputConfig) UnmarshalYAML(node *yaml.Node) error {
 			return err
 		}
 		o.RosApiAddressList = &cfg
+	case "rosRestApiAddressList":
+		var cfg outputs.RosRestApiAddressListConfig
+		if err := node.Decode(&cfg); err != nil {
+			return err
+		}
+		o.RosRestApiAddressList = &cfg
 	case "file":
 		var cfg outputs.FileOutputConfig
 		if err := node.Decode(&cfg); err != nil {

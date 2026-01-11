@@ -54,6 +54,7 @@
     "output": {
       "oneOf": [
         { "$ref": "#/$defs/outputRosApiAddressList" },
+        { "$ref": "#/$defs/outputRosRestApiAddressList" },
         { "$ref": "#/$defs/outputFile" },
         { "$ref": "#/$defs/outputWebhook" }
       ]
@@ -63,6 +64,27 @@
       "additionalProperties": false,
       "properties": {
         "type": { "const": "rosApiAddressList" },
+        "mode": { "type": ["string", "null"], "enum": ["active", "passive", null] },
+        "id": { "type": "string" },
+        "host": { "type": "string" },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "useTLS": { "type": ["boolean", "null"] },
+        "username": { "type": "string" },
+        "password": { "type": "string" },
+        "listName": { "type": "string" },
+        "ttl": { "type": ["string", "null"] },
+        "updateTTL": { "type": ["boolean", "null"] },
+        "recordType": { "type": "string", "enum": ["ip", "host"] },
+        "connectionAttempts": { "type": ["integer", "null"], "minimum": 1 },
+        "reconnectionAttempts": { "type": ["integer", "null"], "minimum": 1 }
+      },
+      "required": ["type", "id", "host", "username", "password", "listName", "recordType"]
+    },
+    "outputRosRestApiAddressList": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "rosRestApiAddressList" },
         "mode": { "type": ["string", "null"], "enum": ["active", "passive", null] },
         "id": { "type": "string" },
         "host": { "type": "string" },

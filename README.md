@@ -7,7 +7,7 @@ emits resolved domains/IPs to one or more outputs (RouterOS address-list, CSV fi
 - UDP/TCP DNS listener.
 - Parallel upstream queries; first response returned to client.
 - Per-domain matching rules with subdomain depth control.
-- RouterOS address-list integration with dedupe and optional TTL updates.
+- RouterOS address-list integration (API and REST) with dedupe and optional TTL updates.
 - File output (CSV) and webhook output.
 - JSON logging with debug mode.
 
@@ -65,6 +65,20 @@ outputs:
     recordType: ip
     connectionAttempts: 3
     reconnectionAttempts: 3
+  - type: rosRestApiAddressList
+    id: ros_rest
+    mode: passive
+    host: http://10.0.0.2
+    port: ~
+    useTLS: false
+    username: admin
+    password: password
+    listName: my_resolved_domains_rest
+    ttl: ~
+    updateTTL: true
+    recordType: ip
+    connectionAttempts: 3
+    reconnectionAttempts: 3
   - type: file
     id: file_main
     mode: active
@@ -105,6 +119,9 @@ Outputs:
 - `rosApiAddressList` supports `host` with optional scheme/port; only `http`/`https` are supported. If omitted, `http` is assumed. When `useTLS` or `port` are omitted, they inherit from the host URL.
 - `rosApiAddressList.connectionAttempts` controls initial connection retries (default `3`).
 - `rosApiAddressList.reconnectionAttempts` controls reconnect retries after a connection failure; if omitted, it inherits `connectionAttempts`.
+- `rosRestApiAddressList` sends requests over REST with basic auth. `host` supports optional scheme/port; only `http`/`https` are supported. If omitted, `http` is assumed. When `useTLS` or `port` are omitted, they inherit from the host URL. Default ports are `80` (HTTP) and `443` (HTTPS).
+- `rosRestApiAddressList.connectionAttempts` controls initial connection retries (default `3`).
+- `rosRestApiAddressList.reconnectionAttempts` controls retries after a REST request failure; if omitted, it inherits `connectionAttempts`.
 - File output `format` can be `csv` (default), `ipset`, or `nftset`. CSV writes `domain,ip` rows to `<path>/<listName>.csv`. `ipset` and `nftset` write dnsmasq rules to `<path>/<listName>.conf`.
 - `ipset` example: `ipset=/showip.net/LIST_NAME`
 - `nftset` example: `nftset=/showip.net/4#inet#fw4#LIST_NAME`

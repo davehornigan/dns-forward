@@ -50,6 +50,20 @@ outputs:
     recordType: ip
     connectionAttempts: 3
     reconnectionAttempts: 3
+  - type: rosRestApiAddressList
+    id: ros_rest_main
+    mode: passive
+    host: http://10.0.0.2
+    port: ~
+    useTLS: false
+    username: admin
+    password: password
+    listName: my_resolved_domains_rest
+    ttl: ~
+    updateTTL: true
+    recordType: ip
+    connectionAttempts: 3
+    reconnectionAttempts: 3
   - type: file
     id: file_main
     mode: active

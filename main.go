@@ -154,6 +154,18 @@ func main() {
 				os.Exit(1)
 			}
 			outputTargets = append(outputTargets, resolver.OutputTarget{ID: outputID, Mode: output.Mode, Writer: ros})
+		case "rosRestApiAddressList":
+			if output.RosRestApiAddressList == nil {
+				slog.Error("rosRestApiAddressList config missing")
+				os.Exit(1)
+			}
+			outputID = strings.TrimSpace(output.RosRestApiAddressList.ID)
+			ros, err := outputs.NewRouterOSRestClient(*output.RosRestApiAddressList, httpTimeout)
+			if err != nil {
+				slog.Error("routeros rest", "error", err)
+				os.Exit(1)
+			}
+			outputTargets = append(outputTargets, resolver.OutputTarget{ID: outputID, Mode: output.Mode, Writer: ros})
 		case "file":
 			if output.File == nil {
 				slog.Error("file config missing")
@@ -210,6 +222,16 @@ func main() {
 					outputSummaries = append(outputSummaries, "rosApiAddressList:"+output.RosApiAddressList.ID+"@"+address)
 				} else {
 					outputSummaries = append(outputSummaries, "rosApiAddressList:"+output.RosApiAddressList.ID+"@"+output.RosApiAddressList.Access.Host)
+				}
+			}
+		case "rosRestApiAddressList":
+			if output.RosRestApiAddressList != nil && output.RosRestApiAddressList.Access.Host != "" {
+				summaryCfg := output.RosRestApiAddressList.Access
+				if err := outputs.ApplyHostOverrides(&summaryCfg); err == nil {
+					address := outputs.FormatRouterOSRestBaseURL(summaryCfg)
+					outputSummaries = append(outputSummaries, "rosRestApiAddressList:"+output.RosRestApiAddressList.ID+"@"+address)
+				} else {
+					outputSummaries = append(outputSummaries, "rosRestApiAddressList:"+output.RosRestApiAddressList.ID+"@"+output.RosRestApiAddressList.Access.Host)
 				}
 			}
 		case "file":
