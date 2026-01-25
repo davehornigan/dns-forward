@@ -7,7 +7,7 @@ emits resolved domains/IPs to one or more outputs (RouterOS address-list, CSV fi
 - UDP/TCP DNS listener.
 - Parallel upstream queries; first response returned to client.
 - Per-domain matching rules with subdomain depth control.
-- RouterOS address-list integration (API and REST) with dedupe and optional TTL updates.
+- RouterOS address-list integration (API and REST) with dedupe (including subnet coverage) and optional TTL updates.
 - File output (CSV) and webhook output.
 - JSON logging with debug mode.
 
@@ -21,6 +21,7 @@ server:
   dnsTimeout: 3s
   httpTimeout: 10s
   debug: false
+  writeIPWithPrefix: false
   excludeSubnets:
     - 10.0.0.0/8
     - 192.168.0.0/16
@@ -98,6 +99,7 @@ Server:
 - `server.timeout` is the overall time budget for a DNS request.
 - `server.dnsTimeout` applies to upstream DNS queries.
 - `server.httpTimeout` applies to webhook and RouterOS API requests.
+- `server.writeIPWithPrefix` writes resolved IPs as `/32` (IPv4) or `/128` (IPv6).
 - `server.excludeSubnets` drops resolved IPs within these CIDRs before writing to outputs.
 
 Upstreams:

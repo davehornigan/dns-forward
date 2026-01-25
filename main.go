@@ -260,7 +260,7 @@ func main() {
 		"outputs", outputSummaries,
 	)
 
-	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, ruleUpstreams, outputTargets, excludeSubnets, timeout, dnsTimeout, httpTimeout, dohHTTP)
+	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, ruleUpstreams, outputTargets, excludeSubnets, timeout, dnsTimeout, httpTimeout, cfg.Server.WriteIPWithPrefix, dohHTTP)
 
 	addr := cfg.Server.ListenAddr
 	if addr == "" {

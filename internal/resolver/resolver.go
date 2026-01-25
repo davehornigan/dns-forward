@@ -43,6 +43,7 @@ type Resolver struct {
 	timeout           time.Duration
 	dnsTimeout        time.Duration
 	httpTimeout       time.Duration
+	writeIPWithPrefix bool
 	dohHTTP           *http.Client
 	fallbackCache     map[string]cachedResponse
 	fallbackMu        sync.Mutex
@@ -60,7 +61,7 @@ type OutputTarget struct {
 	Webhook *outputs.WebhookSender
 }
 
-func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, rules []config.DomainRule, ruleUpstreams map[int][]upstreams.Upstream, outputsList []OutputTarget, excludeSubnets []*net.IPNet, timeout, dnsTimeout, httpTimeout time.Duration, dohHTTP *http.Client) *Resolver {
+func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, rules []config.DomainRule, ruleUpstreams map[int][]upstreams.Upstream, outputsList []OutputTarget, excludeSubnets []*net.IPNet, timeout, dnsTimeout, httpTimeout time.Duration, writeIPWithPrefix bool, dohHTTP *http.Client) *Resolver {
 	if ruleUpstreams == nil {
 		ruleUpstreams = make(map[int][]upstreams.Upstream)
 	}
@@ -74,6 +75,7 @@ func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, 
 		timeout:           timeout,
 		dnsTimeout:        dnsTimeout,
 		httpTimeout:       httpTimeout,
+		writeIPWithPrefix: writeIPWithPrefix,
 		dohHTTP:           dohHTTP,
 		fallbackCache:     make(map[string]cachedResponse),
 	}
@@ -264,11 +266,21 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 }
 
 func (r *Resolver) writeAddress(writer outputs.AddressWriter, listName, domain, address string) {
-	if err := writer.EnsureAddress(listName, domain, address, nil, nil); err != nil {
+	effectiveAddress := address
+	if r.writeIPWithPrefix {
+		if ip := net.ParseIP(strings.TrimSpace(address)); ip != nil {
+			if ip.To4() != nil {
+				effectiveAddress = ip.String() + "/32"
+			} else {
+				effectiveAddress = ip.String() + "/128"
+			}
+		}
+	}
+	if err := writer.EnsureAddress(listName, domain, effectiveAddress, nil, nil); err != nil {
 		slog.Error("write address", writeAddressAttrs(DNSLog{
 			List:    listName,
 			Domain:  domain,
-			Address: address,
+			Address: effectiveAddress,
 		}, err)...)
 	}
 }

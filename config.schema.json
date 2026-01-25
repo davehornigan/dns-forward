@@ -29,7 +29,8 @@
         "timeout": { "type": ["string", "null"] },
         "dnsTimeout": { "type": ["string", "null"] },
         "httpTimeout": { "type": ["string", "null"] },
-        "excludeSubnets": { "type": ["array", "null"], "items": { "type": "string" } }
+        "excludeSubnets": { "type": ["array", "null"], "items": { "type": "string" } },
+        "writeIPWithPrefix": { "type": ["boolean", "null"] }
       }
     }
   },

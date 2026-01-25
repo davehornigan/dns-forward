@@ -101,7 +101,9 @@ type RouterOSClient struct {
 	cfg                   RosApiAddressListConfig
 	conn                  *routeros.Client
 	cache                 map[string]string
+	subnetCache           map[string][]*net.IPNet
 	pending               map[string]bool
+	subnetPending         map[string]bool
 	listNames             map[string]bool
 	mu                    sync.Mutex
 	connMu                sync.Mutex
@@ -199,7 +201,10 @@ func NewRouterOSClient(cfg RosApiAddressListConfig, timeout time.Duration) (*Rou
 		cfg:                  cfg,
 		conn:                 conn,
 		cache:                make(map[string]string),
+		subnetCache:          make(map[string][]*net.IPNet),
 		pending:              make(map[string]bool),
+		subnetPending:        make(map[string]bool),
+		listNames:            make(map[string]bool),
 		address:              address,
 		useTLS:               useTLS,
 		timeout:              timeout,
@@ -317,6 +322,31 @@ func (c *RouterOSClient) findAddressID(listName, address string) (string, error)
 	return "", nil
 }
 
+func (c *RouterOSClient) refreshSubnetCache(listName string) error {
+	if strings.TrimSpace(listName) == "" {
+		return nil
+	}
+	args := []string{
+		"/ip/firewall/address-list/print",
+		fmt.Sprintf("?list=%s", listName),
+		"=.proplist=address",
+	}
+	reply, err := c.runArgs(args)
+	if err != nil {
+		return err
+	}
+	subnets := make([]*net.IPNet, 0, len(reply.Re))
+	for _, re := range reply.Re {
+		if ipNet := parseAddressCIDR(re.Map["address"]); ipNet != nil {
+			subnets = append(subnets, ipNet)
+		}
+	}
+	c.mu.Lock()
+	c.subnetCache[listName] = subnets
+	c.mu.Unlock()
+	return nil
+}
+
 func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error {
 	key := fmt.Sprintf("%s|%s", listName, address)
 	effectiveTTL := ""
@@ -326,7 +356,15 @@ func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *st
 		effectiveTTL = strings.TrimSpace(*c.cfg.TTL)
 	}
 
+	var refreshSubnets bool
 	c.mu.Lock()
+	if listName != "" {
+		c.listNames[listName] = true
+		if _, ok := c.subnetCache[listName]; !ok && !c.subnetPending[listName] {
+			c.subnetPending[listName] = true
+			refreshSubnets = true
+		}
+	}
 	if id, ok := c.cache[key]; ok && id != "" {
 		c.mu.Unlock()
 		if effectiveTTL == "" || !shouldUpdateTTL(c.cfg.UpdateTTL, updateTTL) {
@@ -340,11 +378,28 @@ func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *st
 	}
 	c.pending[key] = true
 	c.mu.Unlock()
+	if refreshSubnets {
+		_ = c.refreshSubnetCache(listName)
+		c.mu.Lock()
+		delete(c.subnetPending, listName)
+		c.mu.Unlock()
+	}
 	defer func() {
 		c.mu.Lock()
 		delete(c.pending, key)
 		c.mu.Unlock()
 	}()
+
+	if ip := parseAddressIP(address); ip != nil {
+		c.mu.Lock()
+		subnets := c.subnetCache[listName]
+		c.mu.Unlock()
+		for _, subnet := range subnets {
+			if subnet != nil && subnet.Contains(ip) {
+				return nil
+			}
+		}
+	}
 
 	id, err := c.findAddressID(listName, address)
 	if err != nil {
@@ -359,7 +414,6 @@ func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *st
 		}
 		return c.updateAddressTTL(id, effectiveTTL)
 	}
-
 	args := []string{
 		"/ip/firewall/address-list/add",
 		fmt.Sprintf("=list=%s", listName),
@@ -414,6 +468,10 @@ func (c *RouterOSClient) refreshAllLists() {
 		}
 		keys = append(keys, key)
 	}
+	listNames := make([]string, 0, len(c.listNames))
+	for listName := range c.listNames {
+		listNames = append(listNames, listName)
+	}
 	c.mu.Unlock()
 
 	for _, key := range keys {
@@ -433,6 +491,10 @@ func (c *RouterOSClient) refreshAllLists() {
 			c.cache[key] = id
 		}
 		c.mu.Unlock()
+	}
+
+	for _, listName := range listNames {
+		_ = c.refreshSubnetCache(listName)
 	}
 }
 
@@ -537,6 +599,36 @@ func splitCacheKey(key string) (string, string, bool) {
 		return "", "", false
 	}
 	return key[:sep], key[sep+1:], true
+}
+
+func parseAddressCIDR(entry string) *net.IPNet {
+	entry = strings.TrimSpace(entry)
+	if entry == "" || !strings.Contains(entry, "/") {
+		return nil
+	}
+	_, ipNet, err := net.ParseCIDR(entry)
+	if err != nil {
+		return nil
+	}
+	if ones, bits := ipNet.Mask.Size(); ones == bits {
+		return nil
+	}
+	return ipNet
+}
+
+func parseAddressIP(entry string) net.IP {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return nil
+	}
+	if ip := net.ParseIP(entry); ip != nil {
+		return ip
+	}
+	_, ipNet, err := net.ParseCIDR(entry)
+	if err != nil || ipNet == nil {
+		return nil
+	}
+	return ipNet.IP
 }
 
 func (f *FileWriter) EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error {

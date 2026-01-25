@@ -60,7 +60,10 @@ type RouterOSRestClient struct {
 	client               *http.Client
 	baseURL              string
 	cache                map[string]string
+	subnetCache          map[string][]*net.IPNet
 	pending              map[string]bool
+	subnetPending        map[string]bool
+	listNames            map[string]bool
 	mu                   sync.Mutex
 	timeout              time.Duration
 	reconnectionAttempts int
@@ -114,7 +117,10 @@ func NewRouterOSRestClient(cfg RosRestApiAddressListConfig, timeout time.Duratio
 		client:               client,
 		baseURL:              baseURL + "/rest/ip/firewall/address-list",
 		cache:                make(map[string]string),
+		subnetCache:          make(map[string][]*net.IPNet),
 		pending:              make(map[string]bool),
+		subnetPending:        make(map[string]bool),
+		listNames:            make(map[string]bool),
 		timeout:              timeout,
 		reconnectionAttempts: reconnectionAttempts,
 	}
@@ -147,7 +153,15 @@ func (c *RouterOSRestClient) EnsureAddress(listName, domain, address string, ttl
 		effectiveTTL = strings.TrimSpace(*c.cfg.TTL)
 	}
 
+	var refreshSubnets bool
 	c.mu.Lock()
+	if listName != "" {
+		c.listNames[listName] = true
+		if _, ok := c.subnetCache[listName]; !ok && !c.subnetPending[listName] {
+			c.subnetPending[listName] = true
+			refreshSubnets = true
+		}
+	}
 	if id, ok := c.cache[key]; ok && id != "" {
 		c.mu.Unlock()
 		if effectiveTTL == "" || !shouldUpdateTTL(c.cfg.UpdateTTL, updateTTL) {
@@ -161,11 +175,28 @@ func (c *RouterOSRestClient) EnsureAddress(listName, domain, address string, ttl
 	}
 	c.pending[key] = true
 	c.mu.Unlock()
+	if refreshSubnets {
+		_ = c.refreshSubnetCache(listName)
+		c.mu.Lock()
+		delete(c.subnetPending, listName)
+		c.mu.Unlock()
+	}
 	defer func() {
 		c.mu.Lock()
 		delete(c.pending, key)
 		c.mu.Unlock()
 	}()
+
+	if ip := parseAddressIP(address); ip != nil {
+		c.mu.Lock()
+		subnets := c.subnetCache[listName]
+		c.mu.Unlock()
+		for _, subnet := range subnets {
+			if subnet != nil && subnet.Contains(ip) {
+				return nil
+			}
+		}
+	}
 
 	id, err := c.findAddressID(listName, address)
 	if err != nil {
@@ -180,7 +211,6 @@ func (c *RouterOSRestClient) EnsureAddress(listName, domain, address string, ttl
 		}
 		return c.updateAddressTTL(id, effectiveTTL)
 	}
-
 	payload := map[string]string{
 		"list":    listName,
 		"address": address,
@@ -253,6 +283,10 @@ func (c *RouterOSRestClient) refreshAllLists() {
 		}
 		keys = append(keys, key)
 	}
+	listNames := make([]string, 0, len(c.listNames))
+	for listName := range c.listNames {
+		listNames = append(listNames, listName)
+	}
 	c.mu.Unlock()
 
 	for _, key := range keys {
@@ -272,6 +306,10 @@ func (c *RouterOSRestClient) refreshAllLists() {
 			c.cache[key] = id
 		}
 		c.mu.Unlock()
+	}
+
+	for _, listName := range listNames {
+		_ = c.refreshSubnetCache(listName)
 	}
 }
 
@@ -319,6 +357,46 @@ func (c *RouterOSRestClient) findAddressID(listName, address string) (string, er
 		}
 	}
 	return "", nil
+}
+
+func (c *RouterOSRestClient) refreshSubnetCache(listName string) error {
+	if strings.TrimSpace(listName) == "" {
+		return nil
+	}
+	query := url.Values{}
+	query.Set("list", listName)
+	endpoint, err := c.withQuery(c.baseURL, query)
+	if err != nil {
+		return err
+	}
+	body, err := c.request(http.MethodGet, endpoint, nil)
+	if err != nil {
+		if !isNoSuchCommand(err) {
+			return err
+		}
+		body, err = c.request(http.MethodGet, c.baseURL, nil)
+		if err != nil {
+			return err
+		}
+	}
+	entries, err := decodeRestEntries(body)
+	if err != nil {
+		return err
+	}
+	subnets := make([]*net.IPNet, 0, len(entries))
+	for _, entry := range entries {
+		if entry["list"] != listName {
+			continue
+		}
+		entryAddress := fmt.Sprint(entry["address"])
+		if ipNet := parseAddressCIDR(entryAddress); ipNet != nil {
+			subnets = append(subnets, ipNet)
+		}
+	}
+	c.mu.Lock()
+	c.subnetCache[listName] = subnets
+	c.mu.Unlock()
+	return nil
 }
 
 func (c *RouterOSRestClient) ping(attempts int) error {

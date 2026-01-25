@@ -4,6 +4,7 @@ server:
   dnsTimeout: 3s
   httpTimeout: 10s
   debug: false
+  writeIPWithPrefix: false
   excludeSubnets:
     - 10.0.0.0/8
     - 192.168.0.0/16

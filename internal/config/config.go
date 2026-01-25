@@ -20,12 +20,13 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Debug          bool          `yaml:"debug"`
-	ListenAddr     string        `yaml:"listenAddr"`
-	Timeout        time.Duration `yaml:"timeout"`
-	DNSTimeout     time.Duration `yaml:"dnsTimeout"`
-	HTTPTimeout    time.Duration `yaml:"httpTimeout"`
-	ExcludeSubnets []string      `yaml:"excludeSubnets"`
+	Debug             bool          `yaml:"debug"`
+	ListenAddr        string        `yaml:"listenAddr"`
+	Timeout           time.Duration `yaml:"timeout"`
+	DNSTimeout        time.Duration `yaml:"dnsTimeout"`
+	HTTPTimeout       time.Duration `yaml:"httpTimeout"`
+	ExcludeSubnets    []string      `yaml:"excludeSubnets"`
+	WriteIPWithPrefix bool          `yaml:"writeIPWithPrefix"`
 }
 
 type OutputConfig struct {
