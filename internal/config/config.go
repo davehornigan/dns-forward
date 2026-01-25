@@ -27,6 +27,7 @@ type ServerConfig struct {
 	HTTPTimeout       time.Duration `yaml:"httpTimeout"`
 	ExcludeSubnets    []string      `yaml:"excludeSubnets"`
 	WriteIPWithPrefix bool          `yaml:"writeIPWithPrefix"`
+	ResolveAllOnStart bool          `yaml:"resolveAllDomainsOnStart"`
 }
 
 type OutputConfig struct {

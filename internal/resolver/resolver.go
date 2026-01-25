@@ -184,7 +184,50 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	if !match {
 		return
 	}
+	r.processMatchedResponses(rule, q, allCh)
+}
 
+func (r *Resolver) ResolveDomain(domain string, rule config.DomainRule, ruleIndex int) {
+	domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	if domain == "" {
+		return
+	}
+	fqdn := dns.Fqdn(domain)
+	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		req := new(dns.Msg)
+		req.SetQuestion(fqdn, qtype)
+		q := req.Question[0]
+
+		upstreamsList := r.upstreams
+		if ruleIndex >= 0 {
+			if ruleUpstreams, ok := r.ruleUpstreams[ruleIndex]; ok && len(ruleUpstreams) > 0 {
+				upstreamsList = ruleUpstreams
+			}
+		}
+
+		disableFallback := rule.DisableFallback
+		resp, firstUpstream, allCh, reason, err := r.resolveParallel(req, upstreamsList, disableFallback)
+		if err != nil {
+			slog.Error("resolve error", resolveErrorAttrs(DNSLog{
+				Qname:     q.Name,
+				Qtype:     dns.TypeToString[q.Qtype],
+				Upstreams: upstreams.Labels(upstreamsList),
+				Reason:    reason,
+			}, err)...)
+			continue
+		}
+		slog.Debug("dns reply", dnsReplyAttrs(DNSLog{
+			Qname:    q.Name,
+			Qtype:    dns.TypeToString[q.Qtype],
+			Upstream: firstUpstream,
+			Rcode:    dns.RcodeToString[resp.Rcode],
+			Answers:  len(resp.Answer),
+		})...)
+		r.processMatchedResponses(rule, q, allCh)
+	}
+}
+
+func (r *Resolver) processMatchedResponses(rule config.DomainRule, q dns.Question, allCh <-chan *dns.Msg) {
 	listName := rule.ListName
 	ruleList := strings.TrimSpace(listName)
 	ruleOutputs := normalizeOutputs(rule.Outputs)

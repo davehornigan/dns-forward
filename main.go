@@ -261,6 +261,15 @@ func main() {
 	)
 
 	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, ruleUpstreams, outputTargets, excludeSubnets, timeout, dnsTimeout, httpTimeout, cfg.Server.WriteIPWithPrefix, dohHTTP)
+	if cfg.Server.ResolveAllOnStart && len(cfg.Domains) > 0 {
+		slog.Info("resolving all domains on start", "domains", len(cfg.Domains))
+		for i, rule := range cfg.Domains {
+			if rule.Domain == "" {
+				continue
+			}
+			res.ResolveDomain(rule.Domain, rule, i)
+		}
+	}
 
 	addr := cfg.Server.ListenAddr
 	if addr == "" {

@@ -30,7 +30,8 @@
         "dnsTimeout": { "type": ["string", "null"] },
         "httpTimeout": { "type": ["string", "null"] },
         "excludeSubnets": { "type": ["array", "null"], "items": { "type": "string" } },
-        "writeIPWithPrefix": { "type": ["boolean", "null"] }
+        "writeIPWithPrefix": { "type": ["boolean", "null"] },
+        "resolveAllDomainsOnStart": { "type": ["boolean", "null"] }
       }
     }
   },

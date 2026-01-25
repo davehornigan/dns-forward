@@ -22,6 +22,7 @@ server:
   httpTimeout: 10s
   debug: false
   writeIPWithPrefix: false
+  resolveAllDomainsOnStart: false
   excludeSubnets:
     - 10.0.0.0/8
     - 192.168.0.0/16
@@ -100,6 +101,7 @@ Server:
 - `server.dnsTimeout` applies to upstream DNS queries.
 - `server.httpTimeout` applies to webhook and RouterOS API requests.
 - `server.writeIPWithPrefix` writes resolved IPs as `/32` (IPv4) or `/128` (IPv6).
+- `server.resolveAllDomainsOnStart` resolves each configured domain at startup (A and AAAA) and emits results to outputs.
 - `server.excludeSubnets` drops resolved IPs within these CIDRs before writing to outputs.
 
 Upstreams:
