@@ -43,14 +43,14 @@ type FileOutputConfig struct {
 }
 
 type RosApiAddressListConfig struct {
-	Access                RosApiAccessConfig `yaml:"-"`
-	ID                    string             `yaml:"id"`
-	ListName              string             `yaml:"listName"`
-	TTL                   *string            `yaml:"ttl"`
-	UpdateTTL             *bool              `yaml:"updateTTL"`
-	RecordType            string             `yaml:"recordType"`
-	ConnectionAttempts    int                `yaml:"connectionAttempts"`
-	ReconnectionAttempts  *int               `yaml:"reconnectionAttempts"`
+	Access               RosApiAccessConfig `yaml:"-"`
+	ID                   string             `yaml:"id"`
+	ListName             string             `yaml:"listName"`
+	TTL                  *string            `yaml:"ttl"`
+	UpdateTTL            *bool              `yaml:"updateTTL"`
+	RecordType           string             `yaml:"recordType"`
+	ConnectionAttempts   int                `yaml:"connectionAttempts"`
+	ReconnectionAttempts *int               `yaml:"reconnectionAttempts"`
 }
 
 func (c *RosApiAddressListConfig) UnmarshalYAML(node *yaml.Node) error {
@@ -98,20 +98,20 @@ type AddressWriter interface {
 }
 
 type RouterOSClient struct {
-	cfg                   RosApiAddressListConfig
-	conn                  *routeros.Client
-	cache                 map[string]string
-	subnetCache           map[string][]*net.IPNet
-	pending               map[string]bool
-	subnetPending         map[string]bool
-	listNames             map[string]bool
-	mu                    sync.Mutex
-	connMu                sync.Mutex
-	address               string
-	useTLS                bool
-	timeout               time.Duration
-	connectionAttempts    int
-	reconnectionAttempts  int
+	cfg                  RosApiAddressListConfig
+	conn                 *routeros.Client
+	cache                map[string]string
+	subnetCache          map[string][]*net.IPNet
+	pending              map[string]bool
+	subnetPending        map[string]bool
+	listNames            map[string]bool
+	mu                   sync.Mutex
+	connMu               sync.Mutex
+	address              string
+	useTLS               bool
+	timeout              time.Duration
+	connectionAttempts   int
+	reconnectionAttempts int
 }
 
 type FileWriter struct {

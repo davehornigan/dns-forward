@@ -36,6 +36,22 @@ domains:
     disableFallback: false
     upstreamsBlacklist:
       - https://dns.google/dns-query
+  - domain: static.example.com
+    matchSubDomains: true
+    maxDepth: 1
+    listName: static
+    recordsTTL: 5m
+    recordsOnly: false
+    records:
+      A:
+        - 111.111.111.111
+      AAAA:
+        - "fe80::1"
+      TXT: hello world
+  - domain: alias.example.com
+    listName: alias
+    records:
+      CNAME: [google.com]
 
 outputs:
   - type: rosApiAddressList

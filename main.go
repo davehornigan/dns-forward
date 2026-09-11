@@ -10,6 +10,7 @@ import (
 
 	"github.com/davehornigan/dns-forward/internal/config"
 	"github.com/davehornigan/dns-forward/internal/outputs"
+	"github.com/davehornigan/dns-forward/internal/records"
 	"github.com/davehornigan/dns-forward/internal/resolver"
 	"github.com/davehornigan/dns-forward/internal/upstreams"
 	"github.com/miekg/dns"
@@ -96,6 +97,25 @@ func main() {
 			os.Exit(1)
 		}
 		ruleUpstreams[i] = filtered
+	}
+
+	ruleRecords := make(map[int]*records.Set)
+	recordSummaries := make([]string, 0, len(cfg.Domains))
+	for i, rule := range cfg.Domains {
+		set, err := records.Compile(rule.Domain, rule.Records.ToMap(), rule.RecordsTTL)
+		if err != nil {
+			slog.Error("parse domain records", "domain", rule.Domain, "error", err)
+			os.Exit(1)
+		}
+		if set == nil {
+			if rule.RecordsOnly {
+				slog.Error("domain recordsOnly requires records", "domain", rule.Domain)
+				os.Exit(1)
+			}
+			continue
+		}
+		ruleRecords[i] = set
+		recordSummaries = append(recordSummaries, rule.Domain+":"+strings.Join(set.Types(), ","))
 	}
 
 	fallbackUpstreams, err := upstreams.ParseUpstreams(cfg.FallbackUpstreams)
@@ -258,9 +278,10 @@ func main() {
 		"upstreams", upstreams.Labels(upstreamsList),
 		"fallback_upstreams", fallbackLabels,
 		"outputs", outputSummaries,
+		"static_records", recordSummaries,
 	)
 
-	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, ruleUpstreams, outputTargets, excludeSubnets, timeout, dnsTimeout, httpTimeout, cfg.Server.WriteIPWithPrefix, dohHTTP)
+	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, ruleUpstreams, ruleRecords, outputTargets, excludeSubnets, timeout, dnsTimeout, httpTimeout, cfg.Server.WriteIPWithPrefix, dohHTTP)
 	if cfg.Server.ResolveAllOnStart && len(cfg.Domains) > 0 {
 		slog.Info("resolving all domains on start", "domains", len(cfg.Domains))
 		for i, rule := range cfg.Domains {

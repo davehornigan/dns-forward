@@ -40,14 +40,52 @@ type OutputConfig struct {
 }
 
 type DomainRule struct {
-	Domain             string   `yaml:"domain"`
-	MatchSubDomains    bool     `yaml:"matchSubDomains"`
-	MaxDepth           *int     `yaml:"maxDepth"`
-	ListName           string   `yaml:"listName"`
-	Outputs            []string `yaml:"outputs"`
-	DisableFallback    bool     `yaml:"disableFallback"`
-	UpstreamsOverride  []string `yaml:"upstreamsOverride"`
-	UpstreamsBlacklist []string `yaml:"upstreamsBlacklist"`
+	Domain             string        `yaml:"domain"`
+	MatchSubDomains    bool          `yaml:"matchSubDomains"`
+	MaxDepth           *int          `yaml:"maxDepth"`
+	ListName           string        `yaml:"listName"`
+	Outputs            []string      `yaml:"outputs"`
+	DisableFallback    bool          `yaml:"disableFallback"`
+	UpstreamsOverride  []string      `yaml:"upstreamsOverride"`
+	UpstreamsBlacklist []string      `yaml:"upstreamsBlacklist"`
+	Records            RecordSet     `yaml:"records"`
+	RecordsTTL         time.Duration `yaml:"recordsTTL"`
+	RecordsOnly        bool          `yaml:"recordsOnly"`
+}
+
+// RecordSet maps a DNS record type name (A, AAAA, CNAME, ...) to its values.
+type RecordSet map[string]StringList
+
+// ToMap flattens the set into plain string slices.
+func (r RecordSet) ToMap() map[string][]string {
+	if len(r) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(r))
+	for key, values := range r {
+		out[key] = values
+	}
+	return out
+}
+
+// StringList accepts either a single scalar or a sequence in YAML.
+type StringList []string
+
+func (l *StringList) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		var value string
+		if err := node.Decode(&value); err != nil {
+			return err
+		}
+		*l = StringList{value}
+		return nil
+	}
+	var values []string
+	if err := node.Decode(&values); err != nil {
+		return err
+	}
+	*l = values
+	return nil
 }
 
 func (o *OutputConfig) UnmarshalYAML(node *yaml.Node) error {

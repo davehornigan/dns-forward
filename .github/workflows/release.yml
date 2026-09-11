@@ -5,12 +5,17 @@ on:
     branches:
       - master
     paths-ignore:
-      - README.md
+      - '**.md'
       - LICENSE
       - .gitignore
+      - .dockerignore
       - Makefile
       - .air.toml
       - config.yaml.dist
+      - config.schema.json
+      - '.githooks/**'
+      - '.agents/**'
+      - '.claude/**'
   workflow_dispatch:
 
 permissions:
@@ -24,18 +29,77 @@ env:
   GO_VERSION: '1.25'
 
 jobs:
+  # Detect whether the push changed anything other than test files. Test-only
+  # pushes still run the quality gate but do not build an image or bump a tag.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code_changed: ${{ steps.detect.outputs.code_changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Detect non-test changes
+        id: detect
+        run: |
+          # Diff base is the LAST RELEASED tag's commit (not just the previous
+          # push), so any unbuilt production change since the last release still
+          # triggers a build — even when an intermediate build failed and the
+          # follow-up fix only touched test/docs files.
+          last_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          base="$(git rev-list -n 1 "$last_tag" 2>/dev/null || true)"
+          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"   # no tag base → build to be safe
+            exit 0
+          fi
+          echo "diffing against last release tag: $last_tag ($base)"
+          files="$(git diff --name-only "$base" '${{ github.sha }}')"
+          echo "changed files:"; echo "$files"
+          # Files that never require a new image/tag: tests, docs, and local-dev
+          # config. code_changed is true only if some OTHER (production) file
+          # changed.
+          nonbuild='(_test\.go$|\.md$|(^|/)Makefile$|(^|/)\.air\.toml$|(^|/)config\.yaml\.dist$|(^|/)config\.schema\.json$|(^|/)\.gitignore$|(^|/)\.dockerignore$|(^|/)LICENSE$|^\.githooks/|^\.agents/|^\.claude/)'
+          if echo "$files" | grep -vE "$nonbuild" | grep -q .; then
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "test/docs/config-only push → no image build" ; echo "code_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Quality gate: nothing gets tagged or released unless the code is formatted,
+  # vets clean, and the tests pass.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Verify formatting
+        run: test -z "$(gofmt -l internal main.go)"
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+
   tag:
     runs-on: ubuntu-latest
+    needs: [test, changes]
+    # Skip tagging/release for test-only pushes (no image, no new tag).
+    if: needs.changes.outputs.code_changed == 'true'
     outputs:
       new_tag: ${{ steps.tag.outputs.new_tag }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Bump tag
         id: tag
-        uses: mathieudutour/github-tag-action@v6.1
+        uses: mathieudutour/github-tag-action@v6.2
         with:
           github_token: ${{ secrets.PAT }}
           tag_prefix: ""
@@ -45,18 +109,18 @@ jobs:
     needs: tag
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           context: git
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -64,7 +128,7 @@ jobs:
             type=raw,value=${{ needs.tag.outputs.new_tag }}
             type=raw,value=latest
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           tags: ${{ steps.meta.outputs.tags }}
@@ -72,6 +136,8 @@ jobs:
           build-args: |
             GOLANG_VERSION=${{ env.GO_VERSION }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
       - name: Create release
         uses: ncipollo/release-action@v1
         with:
@@ -85,7 +151,7 @@ jobs:
     if: failure() && needs.tag.result == 'success' && needs.tag.outputs.new_tag != ''
     steps:
       - name: Delete tag and release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const tag = '${{ needs.tag.outputs.new_tag }}';

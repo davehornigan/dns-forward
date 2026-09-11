@@ -48,7 +48,19 @@
         "outputs": { "type": ["array", "null"], "items": { "type": "string" } },
         "disableFallback": { "type": ["boolean", "null"] },
         "upstreamsOverride": { "type": ["array", "null"], "items": { "type": "string" } },
-        "upstreamsBlacklist": { "type": ["array", "null"], "items": { "type": "string" } }
+        "upstreamsBlacklist": { "type": ["array", "null"], "items": { "type": "string" } },
+        "records": {
+          "type": ["object", "null"],
+          "propertyNames": { "pattern": "^[A-Za-z0-9]+$" },
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ]
+          }
+        },
+        "recordsTTL": { "type": ["string", "null"] },
+        "recordsOnly": { "type": ["boolean", "null"] }
       },
       "required": ["domain"],
       "not": { "required": ["upstreamsOverride", "upstreamsBlacklist"] }

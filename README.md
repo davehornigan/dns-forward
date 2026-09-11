@@ -7,6 +7,7 @@ emits resolved domains/IPs to one or more outputs (RouterOS address-list, CSV fi
 - UDP/TCP DNS listener.
 - Parallel upstream queries; first response returned to client.
 - Per-domain matching rules with subdomain depth control.
+- Preconfigured records per domain: known types are answered locally, unknown types go upstream.
 - RouterOS address-list integration (API and REST) with dedupe (including subnet coverage) and optional TTL updates.
 - File output (CSV) and webhook output.
 - JSON logging with debug mode.
@@ -51,6 +52,18 @@ domains:
     matchSubDomains: false
     upstreamsBlacklist:
       - https://dns.google/dns-query
+  - domain: static.example.com
+    matchSubDomains: true
+    maxDepth: 1
+    listName: static
+    recordsTTL: 5m
+    records:
+      A: [111.111.111.111]
+      AAAA: ["fe80::1"]
+      TXT: hello world
+  - domain: alias.example.com
+    records:
+      CNAME: [google.com]
 
 outputs:
   - type: rosApiAddressList
@@ -117,6 +130,15 @@ Domains:
 - `domains[].upstreamsBlacklist` excludes entries from the primary upstream list for matching domains. Only one of `upstreamsOverride` or `upstreamsBlacklist` may be set.
 - `domains[].disableFallback` disables fallback upstreams for matching domains.
 
+Preconfigured records:
+- `domains[].records` maps a record type (`A`, `AAAA`, `CNAME`, `TXT`, `MX`, `SRV`, `NS`, ...) to one or more values. A query for a configured type is answered locally and never reaches an upstream; every other type is forwarded as usual.
+- Values use zone-file syntax, with shortcuts: targets may be written without a trailing dot (`CNAME: [google.com]`) and `TXT` values are quoted automatically. A single value can be written as a scalar instead of a list.
+- Records follow the rule's own matching: they answer for `domain`, and for every subdomain the rule covers when `matchSubDomains` is set, honouring `maxDepth`. Names beyond `maxDepth` are not matched by the rule at all and go upstream.
+- A `CNAME` cannot be combined with other types at the same name. When an `A`/`AAAA` query hits a `CNAME`-only rule, the target is resolved upstream and the full chain is returned; the target's addresses are written to outputs under the queried name.
+- `domains[].recordsTTL` sets the TTL of preconfigured records (default `5m`).
+- `domains[].recordsOnly` never forwards a covered name upstream: types without a record answer `NOERROR` with no data.
+- Addresses from preconfigured `A`/`AAAA` records are written to outputs like resolved ones, including at startup with `server.resolveAllDomainsOnStart`.
+
 Outputs:
 - All outputs are optional, but at least one must be configured. Every output requires a unique `id`.
 - `outputs[].mode` can be `active` (default) or `passive`. Passive outputs are used only when explicitly listed in `domains[].outputs`.
@@ -140,6 +162,18 @@ Using `air`:
 ```bash
 make air
 ```
+
+## Development
+```bash
+make hooks   # enable the repo git hooks (gofmt on pre-commit)
+make lint    # gofmt check and go vet
+make test    # go test ./...
+make help    # list all targets
+```
+
+`make hooks` points `core.hooksPath` at `.githooks`, so staged Go files are
+gofmt-ed and re-staged on commit. CI runs the same checks and fails on
+unformatted code.
 
 ## Docker
 Run the published image from GHCR:

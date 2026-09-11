@@ -13,6 +13,7 @@ import (
 
 	"github.com/davehornigan/dns-forward/internal/config"
 	"github.com/davehornigan/dns-forward/internal/outputs"
+	"github.com/davehornigan/dns-forward/internal/records"
 	"github.com/davehornigan/dns-forward/internal/upstreams"
 	"github.com/miekg/dns"
 	"log/slog"
@@ -38,6 +39,7 @@ type Resolver struct {
 	fallbackUpstreams []upstreams.Upstream
 	rules             []config.DomainRule
 	ruleUpstreams     map[int][]upstreams.Upstream
+	ruleRecords       map[int]*records.Set
 	outputs           []OutputTarget
 	excludeSubnets    []*net.IPNet
 	timeout           time.Duration
@@ -61,15 +63,19 @@ type OutputTarget struct {
 	Webhook *outputs.WebhookSender
 }
 
-func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, rules []config.DomainRule, ruleUpstreams map[int][]upstreams.Upstream, outputsList []OutputTarget, excludeSubnets []*net.IPNet, timeout, dnsTimeout, httpTimeout time.Duration, writeIPWithPrefix bool, dohHTTP *http.Client) *Resolver {
+func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, rules []config.DomainRule, ruleUpstreams map[int][]upstreams.Upstream, ruleRecords map[int]*records.Set, outputsList []OutputTarget, excludeSubnets []*net.IPNet, timeout, dnsTimeout, httpTimeout time.Duration, writeIPWithPrefix bool, dohHTTP *http.Client) *Resolver {
 	if ruleUpstreams == nil {
 		ruleUpstreams = make(map[int][]upstreams.Upstream)
+	}
+	if ruleRecords == nil {
+		ruleRecords = make(map[int]*records.Set)
 	}
 	return &Resolver{
 		upstreams:         upstreamsList,
 		fallbackUpstreams: fallbackList,
 		rules:             rules,
 		ruleUpstreams:     ruleUpstreams,
+		ruleRecords:       ruleRecords,
 		outputs:           outputsList,
 		excludeSubnets:    excludeSubnets,
 		timeout:           timeout,
@@ -154,6 +160,23 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		}
 	}
 
+	if match && len(req.Question) > 0 {
+		if staticResp, staticCh, ok := r.staticResponse(req, rule, r.ruleRecords[ruleIndex], upstreamsList); ok {
+			_ = w.WriteMsg(staticResp)
+			slog.Debug("dns reply", dnsReplyAttrs(DNSLog{
+				Qname:    qname,
+				Qtype:    qtype,
+				Upstream: staticUpstreamLabel,
+				Rcode:    dns.RcodeToString[staticResp.Rcode],
+				Answers:  len(staticResp.Answer),
+			})...)
+			if staticCh != nil {
+				r.processMatchedResponses(rule, req.Question[0], staticCh)
+			}
+			return
+		}
+	}
+
 	disableFallback := match && rule.DisableFallback
 	resp, firstUpstream, allCh, reason, err := r.resolveParallel(req, upstreamsList, disableFallback)
 	if err != nil {
@@ -205,6 +228,20 @@ func (r *Resolver) ResolveDomain(domain string, rule config.DomainRule, ruleInde
 			}
 		}
 
+		if staticResp, staticCh, ok := r.staticResponse(req, rule, r.ruleRecords[ruleIndex], upstreamsList); ok {
+			slog.Debug("dns reply", dnsReplyAttrs(DNSLog{
+				Qname:    q.Name,
+				Qtype:    dns.TypeToString[q.Qtype],
+				Upstream: staticUpstreamLabel,
+				Rcode:    dns.RcodeToString[staticResp.Rcode],
+				Answers:  len(staticResp.Answer),
+			})...)
+			if staticCh != nil {
+				r.processMatchedResponses(rule, q, staticCh)
+			}
+			continue
+		}
+
 		disableFallback := rule.DisableFallback
 		resp, firstUpstream, allCh, reason, err := r.resolveParallel(req, upstreamsList, disableFallback)
 		if err != nil {
@@ -225,6 +262,97 @@ func (r *Resolver) ResolveDomain(domain string, rule config.DomainRule, ruleInde
 		})...)
 		r.processMatchedResponses(rule, q, allCh)
 	}
+}
+
+// staticUpstreamLabel marks replies served from preconfigured records.
+const staticUpstreamLabel = "static"
+
+// staticResponse answers from preconfigured records when the rule covers the
+// queried name and type. Records apply to the rule's domain and, when the rule
+// sets matchSubDomains, to every subdomain it covers. The returned channel
+// feeds outputs the same way upstream answers do; it is nil when there is
+// nothing to emit. When the rule has no record of the queried type, ok is
+// false and the query is forwarded, unless the rule sets recordsOnly.
+func (r *Resolver) staticResponse(req *dns.Msg, rule config.DomainRule, set *records.Set, upstreamsList []upstreams.Upstream) (*dns.Msg, <-chan *dns.Msg, bool) {
+	if set == nil || len(req.Question) == 0 {
+		return nil, nil, false
+	}
+	q := req.Question[0]
+	name := strings.TrimSuffix(strings.ToLower(q.Name), ".")
+	if q.Qclass != dns.ClassINET || !ruleCoversName(rule, name) {
+		return nil, nil, false
+	}
+
+	answers := set.Answer(q.Name, q.Qtype)
+	chased := false
+	if len(answers) == 0 && (q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA) {
+		if cname := set.CNAME(q.Name); cname != nil {
+			answers = append(answers, cname)
+			chased = true
+		}
+	}
+	if len(answers) == 0 && !rule.RecordsOnly {
+		return nil, nil, false
+	}
+
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	resp.Authoritative = true
+	resp.Answer = answers
+	if len(answers) == 0 {
+		// recordsOnly rule with nothing for this type: NODATA, no outputs.
+		return resp, nil, true
+	}
+	if !chased {
+		return resp, singleResponseChannel(resp), true
+	}
+
+	// The CNAME target is not part of this rule, so follow it upstream and
+	// return the full chain; the target's addresses are what outputs need.
+	target := answers[0].(*dns.CNAME).Target
+	targetResp, targetCh := r.resolveCNAMETarget(target, q.Qtype, rule, upstreamsList)
+	if targetResp == nil {
+		return resp, singleResponseChannel(resp), true
+	}
+	resp.Answer = append(resp.Answer, targetResp.Answer...)
+	resp.Rcode = targetResp.Rcode
+	return resp, targetCh, true
+}
+
+func (r *Resolver) resolveCNAMETarget(target string, qtype uint16, rule config.DomainRule, upstreamsList []upstreams.Upstream) (*dns.Msg, <-chan *dns.Msg) {
+	req := new(dns.Msg)
+	req.SetQuestion(dns.Fqdn(target), qtype)
+	req.RecursionDesired = true
+
+	resp, _, allCh, reason, err := r.resolveParallel(req, upstreamsList, rule.DisableFallback)
+	if err != nil {
+		slog.Error("resolve cname target", resolveErrorAttrs(DNSLog{
+			Qname:     req.Question[0].Name,
+			Qtype:     dns.TypeToString[qtype],
+			Upstreams: upstreams.Labels(upstreamsList),
+			Reason:    reason,
+		}, err)...)
+		drainResponses(allCh)
+		return nil, nil
+	}
+	return resp, allCh
+}
+
+func singleResponseChannel(resp *dns.Msg) <-chan *dns.Msg {
+	ch := make(chan *dns.Msg, 1)
+	ch <- resp
+	close(ch)
+	return ch
+}
+
+func drainResponses(ch <-chan *dns.Msg) {
+	if ch == nil {
+		return
+	}
+	go func() {
+		for range ch {
+		}
+	}()
 }
 
 func (r *Resolver) processMatchedResponses(rule config.DomainRule, q dns.Question, allCh <-chan *dns.Msg) {
@@ -762,31 +890,32 @@ func (r *Resolver) matchDomain(qname string) (bool, config.DomainRule, int) {
 		return true, config.DomainRule{}, -1
 	}
 	name := strings.TrimSuffix(strings.ToLower(qname), ".")
-	labels := strings.Split(name, ".")
 
 	for i, rule := range r.rules {
-		if rule.Domain == "" {
-			continue
-		}
-		domain := rule.Domain
-		if name == domain {
+		if ruleCoversName(rule, name) {
 			return true, rule, i
-		}
-		if !rule.MatchSubDomains {
-			continue
-		}
-		if strings.HasSuffix(name, "."+domain) {
-			if rule.MaxDepth == nil {
-				return true, rule, i
-			}
-			domainLabels := strings.Split(domain, ".")
-			depth := len(labels) - len(domainLabels)
-			if depth <= *rule.MaxDepth {
-				return true, rule, i
-			}
 		}
 	}
 	return false, config.DomainRule{}, -1
+}
+
+// ruleCoversName reports whether the rule applies to name, which must be
+// lowercase and without a trailing dot.
+func ruleCoversName(rule config.DomainRule, name string) bool {
+	if rule.Domain == "" {
+		return false
+	}
+	if name == rule.Domain {
+		return true
+	}
+	if !rule.MatchSubDomains || !strings.HasSuffix(name, "."+rule.Domain) {
+		return false
+	}
+	if rule.MaxDepth == nil {
+		return true
+	}
+	depth := strings.Count(name, ".") - strings.Count(rule.Domain, ".")
+	return depth <= *rule.MaxDepth
 }
 
 func normalizeOutputs(outputsList []string) []string {

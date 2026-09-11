@@ -1,0 +1,15 @@
+#!/bin/sh
+# Auto-format staged Go files with gofmt so unformatted code never reaches CI
+# (the release pipeline fails on `gofmt -l`). Formatted files are re-staged.
+set -e
+
+gofiles=$(git diff --cached --name-only --diff-filter=ACM | grep '\.go$' || true)
+[ -z "$gofiles" ] && exit 0
+
+unformatted=$(gofmt -l $gofiles || true)
+[ -z "$unformatted" ] && exit 0
+
+echo "pre-commit: gofmt-ing:"
+echo "$unformatted" | sed 's/^/  /'
+gofmt -w $unformatted
+git add $unformatted
