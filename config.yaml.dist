@@ -1,3 +1,8 @@
+# Any section can also live in its own .yaml file, named after the section.
+# Paths and globs are relative to this file's directory.
+#include:
+#  - conf.d/*.yaml
+
 server:
   listenAddr: ":55353"
   timeout: 5s
@@ -68,6 +73,10 @@ outputs:
     recordType: ip
     connectionAttempts: 3
     reconnectionAttempts: 3
+    maxConcurrentRequests: 2
+    minRequestInterval: 0s
+    refreshInterval: 5m
+    restoreClearedList: true
   - type: rosRestApiAddressList
     id: ros_rest_main
     mode: passive
@@ -82,6 +91,10 @@ outputs:
     recordType: ip
     connectionAttempts: 3
     reconnectionAttempts: 3
+    maxConcurrentRequests: 2
+    minRequestInterval: 0s
+    refreshInterval: 5m
+    restoreClearedList: true
   - type: file
     id: file_main
     mode: active

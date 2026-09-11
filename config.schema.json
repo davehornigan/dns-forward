@@ -4,6 +4,11 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "include": {
+      "type": ["array", "null"],
+      "items": { "type": "string" },
+      "description": "Paths or globs of .yaml files, each named after the section it holds. Relative to the main config's directory."
+    },
     "upstreams": {
       "type": "array",
       "items": { "type": "string" }
@@ -35,7 +40,7 @@
       }
     }
   },
-  "required": ["upstreams", "outputs"],
+  "$comment": "upstreams and outputs are required at runtime, but either may come from an included file, so neither is required here.",
   "$defs": {
     "domainRule": {
       "type": "object",
@@ -90,7 +95,11 @@
         "updateTTL": { "type": ["boolean", "null"] },
         "recordType": { "type": "string", "enum": ["ip", "host"] },
         "connectionAttempts": { "type": ["integer", "null"], "minimum": 1 },
-        "reconnectionAttempts": { "type": ["integer", "null"], "minimum": 1 }
+        "reconnectionAttempts": { "type": ["integer", "null"], "minimum": 1 },
+        "maxConcurrentRequests": { "type": ["integer", "null"], "minimum": 1 },
+        "minRequestInterval": { "type": ["string", "null"] },
+        "refreshInterval": { "type": ["string", "null"] },
+        "restoreClearedList": { "type": ["boolean", "null"] }
       },
       "required": ["type", "id", "host", "username", "password", "listName", "recordType"]
     },
@@ -111,7 +120,11 @@
         "updateTTL": { "type": ["boolean", "null"] },
         "recordType": { "type": "string", "enum": ["ip", "host"] },
         "connectionAttempts": { "type": ["integer", "null"], "minimum": 1 },
-        "reconnectionAttempts": { "type": ["integer", "null"], "minimum": 1 }
+        "reconnectionAttempts": { "type": ["integer", "null"], "minimum": 1 },
+        "maxConcurrentRequests": { "type": ["integer", "null"], "minimum": 1 },
+        "minRequestInterval": { "type": ["string", "null"] },
+        "refreshInterval": { "type": ["string", "null"] },
+        "restoreClearedList": { "type": ["boolean", "null"] }
       },
       "required": ["type", "id", "host", "username", "password", "listName", "recordType"]
     },

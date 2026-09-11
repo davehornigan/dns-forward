@@ -3,7 +3,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -12,11 +11,15 @@ import (
 )
 
 type Config struct {
+	Include           []string       `yaml:"include"`
 	Upstreams         []string       `yaml:"upstreams"`
 	FallbackUpstreams []string       `yaml:"fallbackUpstreams"`
 	Domains           []DomainRule   `yaml:"domains"`
 	Outputs           []OutputConfig `yaml:"outputs"`
 	Server            ServerConfig   `yaml:"server"`
+
+	// Sources lists the files the config was assembled from, main config first.
+	Sources []string `yaml:"-"`
 }
 
 type ServerConfig struct {
@@ -139,15 +142,52 @@ func (o *OutputConfig) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
+// Load reads the config and merges every file it includes. Included files may
+// be named after the section they carry (domains.yaml, outputs.yaml, ...) or
+// key their sections explicitly. Lists are appended across files, so domains
+// and outputs can be split up; mappings merge key by key, later files winning.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	root, err := loadDocument(path)
 	if err != nil {
 		return nil, err
 	}
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if root == nil {
+		return nil, fmt.Errorf("%s is empty", path)
+	}
+
+	var main struct {
+		Include []string `yaml:"include"`
+	}
+	if err := root.Decode(&main); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	includes, err := resolveIncludes(path, main.Include)
+	if err != nil {
 		return nil, err
 	}
+
+	for _, include := range includes {
+		doc, err := loadDocument(include)
+		if err != nil {
+			return nil, err
+		}
+		if doc == nil {
+			continue
+		}
+		section, err := sectionDocument(include, doc)
+		if err != nil {
+			return nil, err
+		}
+		if err := mergeNodes(root, section, include); err != nil {
+			return nil, err
+		}
+	}
+
+	var cfg Config
+	if err := root.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	cfg.Sources = append([]string{path}, includes...)
 	for i := range cfg.Domains {
 		cfg.Domains[i].Domain = strings.TrimSuffix(strings.ToLower(cfg.Domains[i].Domain), ".")
 	}

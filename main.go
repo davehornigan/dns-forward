@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,15 +21,20 @@ import (
 const (
 	defaultListenAddr = ":53"
 	defaultTimeout    = 5 * time.Second
+	defaultConfigName = "config.yaml"
 )
 
 func main() {
 	var configPath string
-	flag.StringVar(&configPath, "config", "config.yaml", "path to config YAML")
+	var configDir string
+	flag.StringVar(&configPath, "config", defaultConfigName, "config file name, or a path; relative names resolve against -config-dir")
+	flag.StringVar(&configDir, "config-dir", "", "directory holding the config files (env CONFIG_DIR, default: current directory)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+
+	configPath = resolveConfigPath(configPath, configDir)
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -275,11 +281,16 @@ func main() {
 	}
 
 	slog.Info("config",
+		"sources", cfg.Sources,
 		"upstreams", upstreams.Labels(upstreamsList),
 		"fallback_upstreams", fallbackLabels,
 		"outputs", outputSummaries,
 		"static_records", recordSummaries,
 	)
+
+	// Preload the address lists before any resolution happens: one request per
+	// list instead of a lookup per address once the traffic starts.
+	warmupOutputLists(outputTargets, cfg.Domains)
 
 	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, ruleUpstreams, ruleRecords, outputTargets, excludeSubnets, timeout, dnsTimeout, httpTimeout, cfg.Server.WriteIPWithPrefix, dohHTTP)
 	if cfg.Server.ResolveAllOnStart && len(cfg.Domains) > 0 {
@@ -312,6 +323,40 @@ func main() {
 	if err := tcpSrv.ListenAndServe(); err != nil {
 		slog.Error("tcp server", "error", err)
 		os.Exit(1)
+	}
+}
+
+// resolveConfigPath places a relative config name inside the config directory,
+// which comes from -config-dir, then CONFIG_DIR, then the current directory.
+// An absolute -config is used as given.
+func resolveConfigPath(configPath, configDir string) string {
+	if filepath.IsAbs(configPath) {
+		return configPath
+	}
+	if strings.TrimSpace(configDir) == "" {
+		configDir = os.Getenv("CONFIG_DIR")
+	}
+	if strings.TrimSpace(configDir) == "" {
+		return configPath
+	}
+	return filepath.Join(configDir, configPath)
+}
+
+// warmupOutputLists preloads every address list the config can write to, so the
+// first burst of resolutions is answered from cache instead of turning into one
+// router lookup per address.
+func warmupOutputLists(targets []resolver.OutputTarget, rules []config.DomainRule) {
+	var names []string
+	for _, rule := range rules {
+		names = append(names, rule.ListName)
+	}
+	for _, target := range targets {
+		warmer, ok := target.Writer.(outputs.ListWarmer)
+		if !ok {
+			continue
+		}
+		lists := append([]string{target.Writer.DefaultListName()}, names...)
+		warmer.WarmupLists(lists)
 	}
 }
 

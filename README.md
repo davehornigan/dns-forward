@@ -13,7 +13,43 @@ emits resolved domains/IPs to one or more outputs (RouterOS address-list, CSV fi
 - JSON logging with debug mode.
 
 ## Configuration
-Copy `config.yaml.dist` to `config.yaml` and edit:
+Copy `config.yaml.dist` to `config.yaml` and edit.
+
+The config directory comes from `-config-dir`, then `CONFIG_DIR`, then the current
+directory. `-config` names the file inside it (default `config.yaml`); an absolute
+`-config` is used as given.
+
+```bash
+dns-forward                                  # ./config.yaml
+CONFIG_DIR=/etc/dns-forward dns-forward      # /etc/dns-forward/config.yaml
+dns-forward -config-dir /etc/dns-forward     # same, via flag
+```
+
+### Splitting the config
+Any section can live in its own file, merged at startup. The filename names the
+section and the file holds that section's bare value:
+
+```yaml
+# config.yaml
+include:
+  - conf.d/*.yaml
+server:
+  listenAddr: ":55353"
+upstreams:
+  - tls://dns.google
+```
+
+```yaml
+# conf.d/domains.yaml
+- domain: google.com
+  matchSubDomains: true
+```
+
+- Only `.yaml` is accepted. Files named after a section: `server`, `upstreams`, `fallbackUpstreams`, `domains`, `outputs`. `-` and `_` are ignored, so `fallback_upstreams.yaml` works, and a `10-` style prefix orders the merge.
+- `include` takes paths or globs relative to the main config's directory. A glob matching nothing is fine; a plain path that does not exist is an error. `include` only works in the main config.
+- Lists are appended, so `domains` and `outputs` can be spread across several files; mappings like `server` merge key by key, with later files winning. The main config is always merged first, then includes in the order listed (globs sorted by name).
+
+Full example:
 
 ```yaml
 server:
@@ -148,6 +184,21 @@ Outputs:
 - `rosRestApiAddressList` sends requests over REST with basic auth. `host` supports optional scheme/port; only `http`/`https` are supported. If omitted, `http` is assumed. When `useTLS` or `port` are omitted, they inherit from the host URL. Default ports are `80` (HTTP) and `443` (HTTPS).
 - `rosRestApiAddressList.connectionAttempts` controls initial connection retries (default `3`).
 - `rosRestApiAddressList.reconnectionAttempts` controls retries after a REST request failure; if omitted, it inherits `connectionAttempts`.
+
+RouterOS traffic (both `rosApiAddressList` and `rosRestApiAddressList`):
+- Address lists are read in bulk: one request per list caches every entry's id, comment and remaining timeout. Addresses already on the router then cost no requests at all, and a new address costs a single write — its id comes back in the create response.
+- Lists are preloaded at startup before any domain is resolved, so a deploy does not turn into one lookup per address.
+- `maxConcurrentRequests` caps requests in flight (default `2`). For REST it also caps the connection pool, so the router sees a couple of long-lived connections instead of one per address. The API output uses a single connection regardless.
+- `minRequestInterval` adds a minimum gap between requests (default `0`, off). Use it to spread a large batch out further.
+- `refreshInterval` controls how often lists are re-read (default `5m`). One request per list, independent of how many addresses are cached.
+- `restoreClearedList` puts a list back together after the router loses it — a reboot, a restored config or a manual flush (default `true`). Two conditions have to hold, so ordinary churn is never fought:
+  - the list lost **at least a third** of the entries it had at the previous check. Sizes are compared rather than looking for an empty list, because the forwarder keeps writing freshly resolved addresses into the list in the meantime;
+  - an entry is only re-added if **its timeout was not yet due**. Entries the router expired on schedule stay gone; entries without a timeout are always considered early. A restored entry gets the time it had left, not a fresh full timeout.
+
+  Anything that went missing loses its cached id either way, so it is re-added on the next query for that domain even when no bulk restore runs. Set to `false` to leave the router alone entirely.
+- With `updateTTL`, a timeout is only rewritten once the entry is past half its lifetime, so a busy domain does not produce a write on every query.
+
+Outputs (continued):
 - File output `format` can be `csv` (default), `ipset`, or `nftset`. CSV writes `domain,ip` rows to `<path>/<listName>.csv`. `ipset` and `nftset` write dnsmasq rules to `<path>/<listName>.conf`.
 - `ipset` example: `ipset=/showip.net/LIST_NAME`
 - `nftset` example: `nftset=/showip.net/4#inet#fw4#LIST_NAME`

@@ -43,14 +43,18 @@ type FileOutputConfig struct {
 }
 
 type RosApiAddressListConfig struct {
-	Access               RosApiAccessConfig `yaml:"-"`
-	ID                   string             `yaml:"id"`
-	ListName             string             `yaml:"listName"`
-	TTL                  *string            `yaml:"ttl"`
-	UpdateTTL            *bool              `yaml:"updateTTL"`
-	RecordType           string             `yaml:"recordType"`
-	ConnectionAttempts   int                `yaml:"connectionAttempts"`
-	ReconnectionAttempts *int               `yaml:"reconnectionAttempts"`
+	Access                RosApiAccessConfig `yaml:"-"`
+	ID                    string             `yaml:"id"`
+	ListName              string             `yaml:"listName"`
+	TTL                   *string            `yaml:"ttl"`
+	UpdateTTL             *bool              `yaml:"updateTTL"`
+	RecordType            string             `yaml:"recordType"`
+	ConnectionAttempts    int                `yaml:"connectionAttempts"`
+	ReconnectionAttempts  *int               `yaml:"reconnectionAttempts"`
+	MaxConcurrentRequests int                `yaml:"maxConcurrentRequests"`
+	MinRequestInterval    time.Duration      `yaml:"minRequestInterval"`
+	RefreshInterval       time.Duration      `yaml:"refreshInterval"`
+	RestoreClearedList    *bool              `yaml:"restoreClearedList"`
 }
 
 func (c *RosApiAddressListConfig) UnmarshalYAML(node *yaml.Node) error {
@@ -66,6 +70,10 @@ func (c *RosApiAddressListConfig) UnmarshalYAML(node *yaml.Node) error {
 	c.ID = cfg.ID
 	c.ConnectionAttempts = cfg.ConnectionAttempts
 	c.ReconnectionAttempts = cfg.ReconnectionAttempts
+	c.MaxConcurrentRequests = cfg.MaxConcurrentRequests
+	c.MinRequestInterval = cfg.MinRequestInterval
+	c.RefreshInterval = cfg.RefreshInterval
+	c.RestoreClearedList = cfg.RestoreClearedList
 
 	var access RosApiAccessConfig
 	if err := node.Decode(&access); err != nil {
@@ -100,18 +108,15 @@ type AddressWriter interface {
 type RouterOSClient struct {
 	cfg                  RosApiAddressListConfig
 	conn                 *routeros.Client
-	cache                map[string]string
-	subnetCache          map[string][]*net.IPNet
-	pending              map[string]bool
-	subnetPending        map[string]bool
-	listNames            map[string]bool
-	mu                   sync.Mutex
+	cache                *addressCache
+	limiter              *routerLimiter
 	connMu               sync.Mutex
 	address              string
 	useTLS               bool
 	timeout              time.Duration
 	connectionAttempts   int
 	reconnectionAttempts int
+	restoreCleared       bool
 }
 
 type FileWriter struct {
@@ -197,22 +202,30 @@ func NewRouterOSClient(cfg RosApiAddressListConfig, timeout time.Duration) (*Rou
 		return nil, err
 	}
 
+	// The API runs every command over one connection, so concurrency is
+	// already 1; the limiter is what paces those commands.
 	client := &RouterOSClient{
 		cfg:                  cfg,
 		conn:                 conn,
-		cache:                make(map[string]string),
-		subnetCache:          make(map[string][]*net.IPNet),
-		pending:              make(map[string]bool),
-		subnetPending:        make(map[string]bool),
-		listNames:            make(map[string]bool),
+		cache:                newAddressCache(),
+		limiter:              newRouterLimiter(1, cfg.MinRequestInterval),
 		address:              address,
 		useTLS:               useTLS,
 		timeout:              timeout,
 		connectionAttempts:   connectionAttempts,
 		reconnectionAttempts: reconnectionAttempts,
+		restoreCleared:       cfg.RestoreClearedList == nil || *cfg.RestoreClearedList,
 	}
-	client.startCacheRefresher(defaultRouterOSCacheRefresh)
+	client.startCacheRefresher(refreshInterval(cfg.RefreshInterval))
 	return client, nil
+}
+
+// refreshInterval resolves the configured list refresh period.
+func refreshInterval(configured time.Duration) time.Duration {
+	if configured != 0 {
+		return configured
+	}
+	return defaultRouterOSCacheRefresh
 }
 
 func (c *RouterOSClient) DefaultListName() string {
@@ -322,33 +335,107 @@ func (c *RouterOSClient) findAddressID(listName, address string) (string, error)
 	return "", nil
 }
 
-func (c *RouterOSClient) refreshSubnetCache(listName string) error {
-	if strings.TrimSpace(listName) == "" {
+// snapshotList reads a whole address list in one command and caches the item
+// ids, comments and remaining timeouts. One request replaces a per-address
+// lookup for every entry already on the router, which is what keeps a deploy
+// quiet. A list that lost a large share of its entries at once is repopulated.
+func (c *RouterOSClient) snapshotList(listName string, onlyIfMissing bool) error {
+	if !c.cache.claimSnapshot(listName, onlyIfMissing) {
 		return nil
 	}
-	args := []string{
+
+	reply, err := c.runArgs([]string{
 		"/ip/firewall/address-list/print",
 		fmt.Sprintf("?list=%s", listName),
-		"=.proplist=address",
-	}
-	reply, err := c.runArgs(args)
+		"=.proplist=.id,address,comment,timeout",
+	})
 	if err != nil {
+		c.cache.releaseSnapshot(listName)
 		return err
 	}
-	subnets := make([]*net.IPNet, 0, len(reply.Re))
+	entries := make([]listEntry, 0, len(reply.Re))
 	for _, re := range reply.Re {
-		if ipNet := parseAddressCIDR(re.Map["address"]); ipNet != nil {
-			subnets = append(subnets, ipNet)
+		address := strings.TrimSpace(re.Map["address"])
+		if address == "" {
+			continue
 		}
+		entries = append(entries, listEntry{
+			id:      strings.TrimSpace(re.Map[".id"]),
+			address: address,
+			comment: re.Map["comment"],
+			timeout: re.Map["timeout"],
+		})
 	}
-	c.mu.Lock()
-	c.subnetCache[listName] = subnets
-	c.mu.Unlock()
+	restore := c.cache.applySnapshot(listName, entries)
+	c.cache.releaseSnapshot(listName)
+	slog.Debug("routeros list snapshot", "list", listName, "entries", len(entries))
+
+	if len(restore) > 0 && c.restoreCleared {
+		c.restoreList(listName, restore)
+	}
 	return nil
 }
 
+// restoreList re-adds entries that vanished before their timeout was due,
+// after the list lost a large share of its contents at once.
+func (c *RouterOSClient) restoreList(listName string, entries []listEntry) {
+	slog.Warn("routeros list shrank unexpectedly, restoring", "list", listName, "entries", len(entries))
+	restored := 0
+	for _, entry := range entries {
+		id, err := c.addAddress(listName, entry.comment, entry.address, entry.timeout)
+		if err != nil {
+			slog.Error("routeros restore address", "list", listName, "address", entry.address, "error", err)
+			continue
+		}
+		c.storeEntry(listName, entry.address, id, entry.comment, entry.timeout)
+		restored++
+	}
+	slog.Info("routeros list restored", "list", listName, "restored", restored, "total", len(entries))
+}
+
+// WarmupLists preloads the given lists so the first wave of resolutions is
+// served from cache instead of one lookup per address.
+func (c *RouterOSClient) WarmupLists(names []string) {
+	for _, listName := range normalizeListNames(names) {
+		if err := c.snapshotList(listName, true); err != nil {
+			slog.Warn("routeros warmup failed", "list", listName, "error", err)
+		}
+	}
+}
+
+func (c *RouterOSClient) storeEntry(listName, address, id, comment, timeout string) {
+	parsed, known := parseRouterOSDuration(timeout)
+	c.cache.store(cacheKey(listName, address), cachedEntry{
+		id:         id,
+		comment:    comment,
+		timeout:    parsed,
+		hasTimeout: known && parsed > 0,
+	})
+}
+
+func (c *RouterOSClient) addAddress(listName, domain, address, timeout string) (string, error) {
+	args := []string{
+		"/ip/firewall/address-list/add",
+		fmt.Sprintf("=list=%s", listName),
+		fmt.Sprintf("=address=%s", address),
+		fmt.Sprintf("=comment=%s", domain),
+	}
+	if timeout != "" {
+		args = append(args, fmt.Sprintf("=timeout=%s", timeout))
+	}
+	reply, err := c.runArgs(args)
+	if err != nil {
+		return "", err
+	}
+	// `add` reports the new id in the !done sentence, so no follow-up lookup.
+	if id := addReplyID(reply); id != "" {
+		return id, nil
+	}
+	return c.findAddressID(listName, address)
+}
+
 func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *string, updateTTL *bool) error {
-	key := fmt.Sprintf("%s|%s", listName, address)
+	key := cacheKey(listName, address)
 	effectiveTTL := ""
 	if ttl != nil && strings.TrimSpace(*ttl) != "" {
 		effectiveTTL = strings.TrimSpace(*ttl)
@@ -356,101 +443,77 @@ func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *st
 		effectiveTTL = strings.TrimSpace(*c.cfg.TTL)
 	}
 
-	var refreshSubnets bool
-	c.mu.Lock()
-	if listName != "" {
-		c.listNames[listName] = true
-		if _, ok := c.subnetCache[listName]; !ok && !c.subnetPending[listName] {
-			c.subnetPending[listName] = true
-			refreshSubnets = true
-		}
+	c.cache.trackList(listName)
+	if entry, ok := c.cache.lookup(key); ok {
+		return c.refreshTTL(key, entry, effectiveTTL, updateTTL)
 	}
-	if id, ok := c.cache[key]; ok && id != "" {
-		c.mu.Unlock()
-		if effectiveTTL == "" || !shouldUpdateTTL(c.cfg.UpdateTTL, updateTTL) {
-			return nil
-		}
-		return c.updateAddressTTL(id, effectiveTTL)
-	}
-	if c.pending[key] {
-		c.mu.Unlock()
+	if !c.cache.claim(key) {
 		return nil
 	}
-	c.pending[key] = true
-	c.mu.Unlock()
-	if refreshSubnets {
-		_ = c.refreshSubnetCache(listName)
-		c.mu.Lock()
-		delete(c.subnetPending, listName)
-		c.mu.Unlock()
-	}
-	defer func() {
-		c.mu.Lock()
-		delete(c.pending, key)
-		c.mu.Unlock()
-	}()
+	defer c.cache.release(key)
 
-	if ip := parseAddressIP(address); ip != nil {
-		c.mu.Lock()
-		subnets := c.subnetCache[listName]
-		c.mu.Unlock()
-		for _, subnet := range subnets {
-			if subnet != nil && subnet.Contains(ip) {
-				return nil
-			}
-		}
+	// First address for this list: pull the list once instead of looking up
+	// every address separately.
+	if err := c.snapshotList(listName, true); err != nil {
+		slog.Warn("routeros list snapshot failed", "list", listName, "error", err)
+	}
+	if entry, ok := c.cache.lookup(key); ok {
+		return c.refreshTTL(key, entry, effectiveTTL, updateTTL)
+	}
+	if c.cache.coveredBySubnet(listName, address) {
+		return nil
 	}
 
-	id, err := c.findAddressID(listName, address)
+	id, err := c.addAddress(listName, domain, address, effectiveTTL)
 	if err != nil {
 		return err
 	}
-	if id != "" {
-		c.mu.Lock()
-		c.cache[key] = id
-		c.mu.Unlock()
-		if effectiveTTL == "" || !shouldUpdateTTL(c.cfg.UpdateTTL, updateTTL) {
-			return nil
-		}
-		return c.updateAddressTTL(id, effectiveTTL)
-	}
-	args := []string{
-		"/ip/firewall/address-list/add",
-		fmt.Sprintf("=list=%s", listName),
-		fmt.Sprintf("=address=%s", address),
-		fmt.Sprintf("=comment=%s", domain),
-	}
-	if effectiveTTL != "" {
-		args = append(args, fmt.Sprintf("=timeout=%s", effectiveTTL))
-	}
-
-	reply, err := c.runArgs(args)
-	if err != nil {
-		return err
-	}
-	if len(reply.Re) > 0 {
-		if id := reply.Re[0].Map[".id"]; id != "" {
-			c.mu.Lock()
-			c.cache[key] = id
-			c.mu.Unlock()
-			return nil
-		}
-	}
-	id, err = c.findAddressID(listName, address)
-	if err != nil {
-		return err
-	}
-	if id != "" {
-		c.mu.Lock()
-		c.cache[key] = id
-		c.mu.Unlock()
-	}
+	c.storeEntry(listName, address, id, domain, effectiveTTL)
 	return nil
 }
 
+// refreshTTL rewrites an entry's timeout only when it is close to expiry, so a
+// busy domain does not produce a router write on every single query.
+func (c *RouterOSClient) refreshTTL(key string, entry cachedEntry, wantedTTL string, updateTTL *bool) error {
+	if wantedTTL == "" || !shouldUpdateTTL(c.cfg.UpdateTTL, updateTTL) {
+		return nil
+	}
+	if !needsTTLRefresh(entry, wantedTTL) {
+		return nil
+	}
+	if err := c.updateAddressTTL(entry.id, wantedTTL); err != nil {
+		return err
+	}
+	parsed, known := parseRouterOSDuration(wantedTTL)
+	entry.timeout = parsed
+	entry.hasTimeout = known && parsed > 0
+	entry.observedAt = time.Now()
+	c.cache.store(key, entry)
+	return nil
+}
+
+// addReplyID reads the item id RouterOS returns for an /add command.
+func addReplyID(reply *routeros.Reply) string {
+	if reply == nil {
+		return ""
+	}
+	if reply.Done != nil {
+		if id := strings.TrimSpace(reply.Done.Map["ret"]); id != "" {
+			return id
+		}
+	}
+	for _, re := range reply.Re {
+		if id := strings.TrimSpace(re.Map[".id"]); id != "" {
+			return id
+		}
+		if id := strings.TrimSpace(re.Map["ret"]); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
 func (c *RouterOSClient) updateAddressTTL(id, ttl string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	_, err := c.runArgs([]string{
 		"/ip/firewall/address-list/set",
 		fmt.Sprintf("=.id=%s", id),
@@ -459,42 +522,13 @@ func (c *RouterOSClient) updateAddressTTL(id, ttl string) error {
 	return err
 }
 
+// refreshAllLists re-reads every touched list, one request per list, so the
+// periodic refresh does not scale with the number of cached addresses.
 func (c *RouterOSClient) refreshAllLists() {
-	c.mu.Lock()
-	keys := make([]string, 0, len(c.cache))
-	for key := range c.cache {
-		if c.pending[key] {
-			continue
+	for _, listName := range c.cache.listNames() {
+		if err := c.snapshotList(listName, false); err != nil {
+			slog.Warn("routeros refresh list failed", "list", listName, "error", err)
 		}
-		keys = append(keys, key)
-	}
-	listNames := make([]string, 0, len(c.listNames))
-	for listName := range c.listNames {
-		listNames = append(listNames, listName)
-	}
-	c.mu.Unlock()
-
-	for _, key := range keys {
-		listName, address, ok := splitCacheKey(key)
-		if !ok {
-			continue
-		}
-		id, err := c.findAddressID(listName, address)
-		if err != nil {
-			slog.Warn("routeros refresh cache failed", "list", listName, "address", address, "error", err)
-			continue
-		}
-		c.mu.Lock()
-		if id == "" {
-			delete(c.cache, key)
-		} else {
-			c.cache[key] = id
-		}
-		c.mu.Unlock()
-	}
-
-	for _, listName := range listNames {
-		_ = c.refreshSubnetCache(listName)
 	}
 }
 
@@ -512,6 +546,8 @@ func (c *RouterOSClient) startCacheRefresher(interval time.Duration) {
 }
 
 func (c *RouterOSClient) run(cmd string, args ...string) (*routeros.Reply, error) {
+	c.limiter.acquire()
+	defer c.limiter.release()
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 	runArgs := make([]string, 0, 1+len(args))
@@ -545,6 +581,8 @@ func (c *RouterOSClient) run(cmd string, args ...string) (*routeros.Reply, error
 }
 
 func (c *RouterOSClient) runArgs(args []string) (*routeros.Reply, error) {
+	c.limiter.acquire()
+	defer c.limiter.release()
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 	reply, err := c.conn.RunArgs(args)
