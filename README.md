@@ -42,7 +42,7 @@ upstreams:
 ```yaml
 # conf.d/domains.yaml
 - domain: google.com
-  matchSubDomains: true
+  matchingType: withSubdomains
 ```
 
 - Only `.yaml` is accepted. Files named after a section: `server`, `upstreams`, `fallbackUpstreams`, `domains`, `outputs`. `-` and `_` are ignored, so `fallback_upstreams.yaml` works, and a `10-` style prefix orders the merge.
@@ -75,21 +75,21 @@ fallbackUpstreams:
 
 domains:
   - domain: google.com
-    matchSubDomains: true
+    matchingType: withSubdomains
     maxDepth: ~
   - domain: openai.com
-    matchSubDomains: true
+    matchingType: withSubdomains
     listName: openai
     disableFallback: false
     upstreamsOverride:
       - tls://one.one.one.one
       - https://one.one.one.one/dns-query
   - domain: example.com
-    matchSubDomains: false
+    matchingType: exact
     upstreamsBlacklist:
       - https://dns.google/dns-query
   - domain: static.example.com
-    matchSubDomains: true
+    matchingType: withSubdomains
     maxDepth: 1
     listName: static
     recordsTTL: 5m
@@ -99,7 +99,7 @@ domains:
       TXT: hello world
   - domain: alias.example.com
     records:
-      CNAME: [google.com]
+      CNAME: google.com
 
 outputs:
   - type: rosApiAddressList
@@ -160,7 +160,13 @@ Upstreams:
 - `fallbackUpstreams` are only used when no primary upstream returns an address, and their answers are not written to address lists. If omitted, defaults to `udp://1.1.1.1:53`.
 
 Domains:
-- A rule naming the queried domain exactly always wins over a rule that only covers it through `matchSubDomains`, whatever order they appear in. Among rules of the same kind the first one in the config wins, so put narrower subdomain rules above broader ones. A name that falls outside one rule's `maxDepth` can still be picked up by a broader rule further down.
+- `domains[].matchingType` says which names the rule applies to:
+  - `exact` (default) — the domain itself only;
+  - `withSubdomains` — the domain and its subdomains;
+  - `subdomainsOnly` — the subdomains but not the domain itself.
+
+  Values are case-insensitive and `-`/`_` are ignored, so `with_subdomains` also works. `maxDepth` bounds how deep a subdomain may be, counted from the domain.
+- A rule that applies to the queried domain itself (`exact` or `withSubdomains`) always wins over one that only reaches it as a subdomain, whatever order they appear in. Among rules of the same kind the first one in the config wins, so put narrower subdomain rules above broader ones. A name that falls outside one rule's `maxDepth` can still be picked up by a broader rule further down.
 - `domains[].listName` overrides the output list name for all outputs; otherwise each output uses its own `listName`.
 - `domains[].outputs` controls which outputs are used by ID. If omitted or null, all outputs are used. If empty, nothing is written.
 - `domains[].upstreamsOverride` overrides the primary upstream list for matching domains; if omitted, global `upstreams` are used. Fallback upstreams are always shared.
@@ -169,9 +175,11 @@ Domains:
 
 Preconfigured records:
 - `domains[].records` maps a record type (`A`, `AAAA`, `CNAME`, `TXT`, `MX`, `SRV`, `NS`, ...) to one or more values. A query for a configured type is answered locally and never reaches an upstream; every other type is forwarded as usual.
-- Values use zone-file syntax, with shortcuts: targets may be written without a trailing dot (`CNAME: [google.com]`) and `TXT` values are quoted automatically. A single value can be written as a scalar instead of a list.
-- Records follow the rule's own matching: they answer for `domain`, and for every subdomain the rule covers when `matchSubDomains` is set, honouring `maxDepth`. Names beyond `maxDepth` are not matched by the rule at all and go upstream.
-- A `CNAME` cannot be combined with other types at the same name. When an `A`/`AAAA` query hits a `CNAME`-only rule, the target is resolved upstream and the full chain is returned; the target's addresses are written to outputs under the queried name.
+- Values use zone-file syntax, with shortcuts: targets may be written without a trailing dot (`CNAME: google.com`) and `TXT` values are quoted automatically. A single value can be written as a scalar instead of a list.
+- Records follow the rule's own `matchingType`, so they answer for every name the rule covers, honouring `maxDepth`. Names the rule does not cover go upstream.
+- Every type but `CNAME` may repeat on a name: several `TXT` records (SPF, DKIM, verification tokens) or several `A` records are normal. A name holds exactly one `CNAME` and it cannot be combined with other types — the DNS standard requires it, since a name has exactly one canonical name. For that reason `CNAME` must be written as a single value, not a list.
+- A `CNAME` pointing at the name it answers for is a loop and is rejected at startup. Under `withSubdomains` a target can collide with a subdomain at query time instead; that answer is dropped with a warning and the query is forwarded (or answered as NODATA under `recordsOnly`).
+- When an `A`/`AAAA` query hits a `CNAME`-only rule, the target is resolved upstream and the full chain is returned; the target's addresses are written to outputs under the queried name.
 - `domains[].recordsTTL` sets the TTL of preconfigured records (default `5m`).
 - `domains[].recordsOnly` never forwards a covered name upstream: types without a record answer `NOERROR` with no data.
 - Addresses from preconfigured `A`/`AAAA` records are written to outputs like resolved ones, including at startup with `server.resolveAllDomainsOnStart`.

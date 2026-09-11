@@ -29,7 +29,7 @@ func TestRuleCoversName(t *testing.T) {
 		},
 		{
 			name: "subdomains unlimited",
-			rule: config.DomainRule{Domain: "example.com", MatchSubDomains: true},
+			rule: config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains},
 			want: map[string]bool{
 				"example.com":       true,
 				"www.example.com":   true,
@@ -41,7 +41,7 @@ func TestRuleCoversName(t *testing.T) {
 		},
 		{
 			name: "subdomains with maxDepth",
-			rule: config.DomainRule{Domain: "example.com", MatchSubDomains: true, MaxDepth: intPtr(1)},
+			rule: config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains, MaxDepth: intPtr(1)},
 			want: map[string]bool{
 				"example.com":     true,
 				"www.example.com": true,
@@ -49,8 +49,32 @@ func TestRuleCoversName(t *testing.T) {
 			},
 		},
 		{
+			name: "subdomains only",
+			rule: config.DomainRule{Domain: "example.com", MatchingType: config.MatchSubdomainsOnly},
+			want: map[string]bool{
+				"example.com":     false,
+				"www.example.com": true,
+				"a.b.example.com": true,
+				"example.org":     false,
+			},
+		},
+		{
+			name: "subdomains only with maxDepth",
+			rule: config.DomainRule{Domain: "example.com", MatchingType: config.MatchSubdomainsOnly, MaxDepth: intPtr(1)},
+			want: map[string]bool{
+				"example.com":     false,
+				"www.example.com": true,
+				"a.b.example.com": false,
+			},
+		},
+		{
+			name: "zero value behaves as exact",
+			rule: config.DomainRule{Domain: "example.com"},
+			want: map[string]bool{"example.com": true, "www.example.com": false},
+		},
+		{
 			name: "empty domain",
-			rule: config.DomainRule{MatchSubDomains: true},
+			rule: config.DomainRule{MatchingType: config.MatchWithSubdomains},
 			want: map[string]bool{"": false, "example.com": false},
 		},
 	}
@@ -69,7 +93,7 @@ func TestRuleCoversName(t *testing.T) {
 // An exact rule beats a subdomain rule no matter which is declared first.
 func TestMatchDomainPrefersExactRule(t *testing.T) {
 	exact := config.DomainRule{Domain: "api.example.com", ListName: "exact"}
-	wildcard := config.DomainRule{Domain: "example.com", MatchSubDomains: true, ListName: "wildcard"}
+	wildcard := config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains, ListName: "wildcard"}
 
 	orders := map[string][]config.DomainRule{
 		"wildcard declared first": {wildcard, exact},
@@ -97,8 +121,8 @@ func TestMatchDomainPrefersExactRule(t *testing.T) {
 // Exactness wins over declaration order, but a deeper subdomain rule does not:
 // among subdomain rules the config order still decides.
 func TestMatchDomainKeepsOrderAmongSubdomainRules(t *testing.T) {
-	broad := config.DomainRule{Domain: "example.com", MatchSubDomains: true, ListName: "broad"}
-	deep := config.DomainRule{Domain: "api.example.com", MatchSubDomains: true, ListName: "deep"}
+	broad := config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains, ListName: "broad"}
+	deep := config.DomainRule{Domain: "api.example.com", MatchingType: config.MatchWithSubdomains, ListName: "deep"}
 
 	res := New(nil, nil, []config.DomainRule{broad, deep}, nil, nil, nil, nil, 0, 0, 0, false, nil)
 	if _, rule, _ := res.matchDomain("v1.api.example.com."); rule.ListName != "broad" {
@@ -107,6 +131,38 @@ func TestMatchDomainKeepsOrderAmongSubdomainRules(t *testing.T) {
 	// The exact name of the deeper rule still reaches it.
 	if _, rule, _ := res.matchDomain("api.example.com."); rule.ListName != "deep" {
 		t.Errorf("expected the exact rule, got %q", rule.ListName)
+	}
+}
+
+// A subdomainsOnly rule must not answer for the domain it is named after, even
+// though it is the only rule naming it.
+func TestMatchDomainSubdomainsOnlySkipsApex(t *testing.T) {
+	rules := []config.DomainRule{
+		{Domain: "example.com", MatchingType: config.MatchSubdomainsOnly, ListName: "subs"},
+	}
+	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil)
+
+	if match, _, _ := res.matchDomain("example.com."); match {
+		t.Error("expected the apex to be unmatched")
+	}
+	if match, rule, _ := res.matchDomain("www.example.com."); !match || rule.ListName != "subs" {
+		t.Errorf("expected the subdomain to match, got (%v, %q)", match, rule.ListName)
+	}
+}
+
+// An exact rule and a subdomainsOnly rule for the same domain split the work.
+func TestMatchDomainSubdomainsOnlyAlongsideExact(t *testing.T) {
+	rules := []config.DomainRule{
+		{Domain: "example.com", MatchingType: config.MatchSubdomainsOnly, ListName: "subs"},
+		{Domain: "example.com", MatchingType: config.MatchExact, ListName: "apex"},
+	}
+	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil)
+
+	if _, rule, index := res.matchDomain("example.com."); rule.ListName != "apex" || index != 1 {
+		t.Errorf("expected the exact rule for the apex, got (%q, %d)", rule.ListName, index)
+	}
+	if _, rule, index := res.matchDomain("www.example.com."); rule.ListName != "subs" || index != 0 {
+		t.Errorf("expected the subdomains rule, got (%q, %d)", rule.ListName, index)
 	}
 }
 
@@ -143,8 +199,8 @@ func TestIndexExactRulesNormalizes(t *testing.T) {
 }
 
 func TestMatchDomainFallsThroughToBroaderRule(t *testing.T) {
-	narrow := config.DomainRule{Domain: "example.com", MatchSubDomains: true, MaxDepth: intPtr(1), ListName: "narrow"}
-	broad := config.DomainRule{Domain: "example.com", MatchSubDomains: true, ListName: "broad"}
+	narrow := config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains, MaxDepth: intPtr(1), ListName: "narrow"}
+	broad := config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains, ListName: "broad"}
 	res := New(nil, nil, []config.DomainRule{narrow, broad}, nil, nil, nil, nil, 0, 0, 0, false, nil)
 
 	tests := map[string]struct {
@@ -192,7 +248,7 @@ func question(qname string, qtype uint16) *dns.Msg {
 }
 
 func TestStaticResponseSubdomains(t *testing.T) {
-	rule := config.DomainRule{Domain: "example.com", MatchSubDomains: true, MaxDepth: intPtr(1)}
+	rule := config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains, MaxDepth: intPtr(1)}
 	res, set := newResolverWithRecords(t, rule, map[string][]string{"A": {"111.111.111.111"}})
 
 	t.Run("exact name", func(t *testing.T) {
@@ -245,12 +301,12 @@ func TestStaticResponseExactRuleIgnoresSubdomains(t *testing.T) {
 	res, set := newResolverWithRecords(t, rule, map[string][]string{"A": {"111.111.111.111"}})
 
 	if _, _, ok := res.staticResponse(question("www.example.com", dns.TypeA), rule, set, nil); ok {
-		t.Error("expected subdomains to be forwarded without matchSubDomains")
+		t.Error("expected subdomains to be forwarded by an exact rule")
 	}
 }
 
 func TestStaticResponseRecordsOnly(t *testing.T) {
-	rule := config.DomainRule{Domain: "example.com", MatchSubDomains: true, RecordsOnly: true}
+	rule := config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains, RecordsOnly: true}
 	res, set := newResolverWithRecords(t, rule, map[string][]string{"A": {"111.111.111.111"}})
 
 	for _, qname := range []string{"example.com", "www.example.com"} {
@@ -264,6 +320,49 @@ func TestStaticResponseRecordsOnly(t *testing.T) {
 		if ch != nil {
 			t.Errorf("expected no outputs for a NODATA answer to %q", qname)
 		}
+	}
+}
+
+// A CNAME whose target is the queried name is a loop; it must not be served.
+// The config check cannot catch this one: the rule covers subdomains, so the
+// record answers under a name that only equals the target at query time.
+func TestStaticResponseSkipsSelfCNAME(t *testing.T) {
+	rule := config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains}
+	res, set := newResolverWithRecords(t, rule, map[string][]string{"CNAME": {"www.example.com"}})
+
+	// Querying the loop name: nothing usable, so the query is forwarded.
+	if _, _, ok := res.staticResponse(question("www.example.com", dns.TypeA), rule, set, nil); ok {
+		t.Error("expected a self-referencing CNAME to be skipped for A")
+	}
+	if _, _, ok := res.staticResponse(question("www.example.com", dns.TypeCNAME), rule, set, nil); ok {
+		t.Error("expected a self-referencing CNAME to be skipped for CNAME")
+	}
+
+	// Any other name under the rule still gets the alias.
+	resp, _, ok := res.staticResponse(question("api.example.com", dns.TypeCNAME), rule, set, nil)
+	if !ok || len(resp.Answer) != 1 {
+		t.Fatalf("expected the alias for a different name, got %v", resp)
+	}
+	if target := resp.Answer[0].(*dns.CNAME).Target; target != "www.example.com." {
+		t.Errorf("unexpected target %q", target)
+	}
+}
+
+// With recordsOnly the loop still must not be served, and the query must not
+// escape upstream either.
+func TestStaticResponseSelfCNAMEWithRecordsOnly(t *testing.T) {
+	rule := config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains, RecordsOnly: true}
+	res, set := newResolverWithRecords(t, rule, map[string][]string{"CNAME": {"www.example.com"}})
+
+	resp, ch, ok := res.staticResponse(question("www.example.com", dns.TypeA), rule, set, nil)
+	if !ok {
+		t.Fatal("expected recordsOnly to keep answering locally")
+	}
+	if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 0 {
+		t.Errorf("expected NODATA instead of a loop, got %v", resp)
+	}
+	if ch != nil {
+		t.Error("expected no outputs for a NODATA answer")
 	}
 }
 
@@ -283,7 +382,7 @@ func benchmarkRules(n int) []config.DomainRule {
 	for i := 0; i < n; i++ {
 		rules = append(rules, config.DomainRule{Domain: fmt.Sprintf("domain%d.example", i)})
 	}
-	rules = append(rules, config.DomainRule{Domain: "catchall.example", MatchSubDomains: true})
+	rules = append(rules, config.DomainRule{Domain: "catchall.example", MatchingType: config.MatchWithSubdomains})
 	return rules
 }
 

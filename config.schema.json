@@ -47,7 +47,7 @@
       "additionalProperties": false,
       "properties": {
         "domain": { "type": "string" },
-        "matchSubDomains": { "type": ["boolean", "null"] },
+        "matchingType": { "type": ["string", "null"], "enum": ["exact", "withSubdomains", "subdomainsOnly", null] },
         "maxDepth": { "type": ["integer", "null"], "minimum": 0 },
         "listName": { "type": ["string", "null"] },
         "outputs": { "type": ["array", "null"], "items": { "type": "string" } },
@@ -62,6 +62,10 @@
               { "type": "string" },
               { "type": "array", "items": { "type": "string" } }
             ]
+          },
+          "properties": {
+            "CNAME": { "type": "string", "$comment": "a name has exactly one canonical name, so a list is not allowed" },
+            "cname": { "type": "string" }
           }
         },
         "recordsTTL": { "type": ["string", "null"] },

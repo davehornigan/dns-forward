@@ -42,9 +42,65 @@ type OutputConfig struct {
 	Webhook               *outputs.WebhookConfig               `yaml:"-"`
 }
 
+// MatchingType says which names a domain rule applies to.
+type MatchingType string
+
+const (
+	// MatchExact matches the domain itself and nothing else. The default.
+	MatchExact MatchingType = "exact"
+	// MatchWithSubdomains matches the domain and its subdomains.
+	MatchWithSubdomains MatchingType = "withSubdomains"
+	// MatchSubdomainsOnly matches the subdomains but not the domain itself.
+	MatchSubdomainsOnly MatchingType = "subdomainsOnly"
+)
+
+var matchingTypes = []MatchingType{MatchExact, MatchWithSubdomains, MatchSubdomainsOnly}
+
+// ParseMatchingType accepts the value in any case, with or without separators,
+// so "withSubdomains", "with_subdomains" and "WITH-SUBDOMAINS" all work.
+func ParseMatchingType(value string) (MatchingType, error) {
+	normalized := normalizeEnumValue(value)
+	if normalized == "" {
+		return MatchExact, nil
+	}
+	for _, candidate := range matchingTypes {
+		if normalizeEnumValue(string(candidate)) == normalized {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("unsupported matchingType %q, expected one of %s", value, joinMatchingTypes())
+}
+
+func normalizeEnumValue(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, "-", "")
+	value = strings.ReplaceAll(value, "_", "")
+	return value
+}
+
+func joinMatchingTypes() string {
+	names := make([]string, 0, len(matchingTypes))
+	for _, candidate := range matchingTypes {
+		names = append(names, string(candidate))
+	}
+	return strings.Join(names, ", ")
+}
+
+// MatchesExactly reports whether the rule applies to the domain itself. The
+// zero value behaves as MatchExact, so a rule built in code without setting the
+// field matches its domain rather than nothing.
+func (t MatchingType) MatchesExactly() bool {
+	return t == "" || t == MatchExact || t == MatchWithSubdomains
+}
+
+// MatchesSubdomains reports whether the rule applies to subdomains.
+func (t MatchingType) MatchesSubdomains() bool {
+	return t == MatchWithSubdomains || t == MatchSubdomainsOnly
+}
+
 type DomainRule struct {
 	Domain             string        `yaml:"domain"`
-	MatchSubDomains    bool          `yaml:"matchSubDomains"`
+	MatchingType       MatchingType  `yaml:"matchingType"`
 	MaxDepth           *int          `yaml:"maxDepth"`
 	ListName           string        `yaml:"listName"`
 	Outputs            []string      `yaml:"outputs"`
@@ -54,6 +110,34 @@ type DomainRule struct {
 	Records            RecordSet     `yaml:"records"`
 	RecordsTTL         time.Duration `yaml:"recordsTTL"`
 	RecordsOnly        bool          `yaml:"recordsOnly"`
+}
+
+// removedDomainFields map retired keys to the migration hint shown for them.
+var removedDomainFields = map[string]string{
+	"matchsubdomains": "matchSubDomains has been replaced by matchingType: use `matchingType: withSubdomains` instead of `matchSubDomains: true`, and drop the field (or use `matchingType: exact`) instead of `matchSubDomains: false`",
+}
+
+func (r *DomainRule) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if hint, removed := removedDomainFields[normalizeEnumValue(node.Content[i].Value)]; removed {
+				return errors.New(hint)
+			}
+		}
+	}
+
+	type raw DomainRule
+	var rule raw
+	if err := node.Decode(&rule); err != nil {
+		return err
+	}
+	matching, err := ParseMatchingType(string(rule.MatchingType))
+	if err != nil {
+		return err
+	}
+	rule.MatchingType = matching
+	*r = DomainRule(rule)
+	return nil
 }
 
 // RecordSet maps a DNS record type name (A, AAAA, CNAME, ...) to its values.
@@ -69,6 +153,35 @@ func (r RecordSet) ToMap() map[string][]string {
 		out[key] = values
 	}
 	return out
+}
+
+// singleValueRecords are the record types a name may hold only one of, so a
+// list is a config mistake rather than a shorthand.
+var singleValueRecords = map[string]bool{"CNAME": true}
+
+func (r *RecordSet) UnmarshalYAML(node *yaml.Node) error {
+	if node.Tag == "!!null" {
+		*r = nil
+		return nil
+	}
+	if node.Kind != yaml.MappingNode {
+		return errors.New("records must map a record type to its value(s)")
+	}
+	out := make(RecordSet, len(node.Content)/2)
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i], node.Content[i+1]
+		name := strings.ToUpper(strings.TrimSpace(key.Value))
+		if singleValueRecords[name] && value.Kind == yaml.SequenceNode {
+			return fmt.Errorf("%s takes a single value, not a list: write `%s: target.example.com`", name, key.Value)
+		}
+		var values StringList
+		if err := value.Decode(&values); err != nil {
+			return err
+		}
+		out[key.Value] = values
+	}
+	*r = out
+	return nil
 }
 
 // StringList accepts either a single scalar or a sequence in YAML.

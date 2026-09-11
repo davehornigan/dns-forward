@@ -65,12 +65,17 @@ func Compile(domain string, raw map[string][]string, ttl time.Duration) (*Set, e
 	if len(set.byType) == 0 {
 		return nil, nil
 	}
-	if _, hasCNAME := set.byType[dns.TypeCNAME]; hasCNAME {
-		if len(set.byType[dns.TypeCNAME]) > 1 {
+	if cnames, hasCNAME := set.byType[dns.TypeCNAME]; hasCNAME {
+		if len(cnames) > 1 {
 			return nil, errors.New("only one CNAME record is allowed")
 		}
 		if len(set.byType) > 1 {
 			return nil, errors.New("CNAME cannot be combined with other record types")
+		}
+		// A CNAME to its own name is a loop: following it leads straight back
+		// to the same question.
+		if cname, ok := cnames[0].(*dns.CNAME); ok && strings.EqualFold(cname.Target, fqdn) {
+			return nil, fmt.Errorf("CNAME points at its own domain %q", domain)
 		}
 	}
 	for qtype := range set.byType {

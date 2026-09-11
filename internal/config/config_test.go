@@ -61,7 +61,7 @@ upstreams:
 `)
 	writeFile(t, dir, "conf.d/domains.yaml", `
 - domain: google.com
-  matchSubDomains: true
+  matchingType: withSubdomains
 - domain: openai.com
 `)
 	writeFile(t, dir, "conf.d/outputs.yaml", `
@@ -82,8 +82,11 @@ debug: true
 	if len(cfg.Domains) != 2 || cfg.Domains[0].Domain != "google.com" || cfg.Domains[1].Domain != "openai.com" {
 		t.Errorf("unexpected domains %+v", cfg.Domains)
 	}
-	if !cfg.Domains[0].MatchSubDomains {
-		t.Error("expected matchSubDomains to survive the merge")
+	if cfg.Domains[0].MatchingType != MatchWithSubdomains {
+		t.Errorf("expected matchingType to survive the merge, got %q", cfg.Domains[0].MatchingType)
+	}
+	if cfg.Domains[1].MatchingType != MatchExact {
+		t.Errorf("expected exact matching by default, got %q", cfg.Domains[1].MatchingType)
 	}
 	if len(cfg.Outputs) != 1 || cfg.Outputs[0].Type != "file" || cfg.Outputs[0].File == nil {
 		t.Errorf("unexpected outputs %+v", cfg.Outputs)
@@ -256,5 +259,147 @@ domains:
 	}
 	if len(records["AAAA"]) != 2 {
 		t.Errorf("expected both AAAA values, got %v", records["AAAA"])
+	}
+}
+
+func TestParseMatchingType(t *testing.T) {
+	accepted := map[string]MatchingType{
+		"":                 MatchExact,
+		"exact":            MatchExact,
+		"EXACT":            MatchExact,
+		"withSubdomains":   MatchWithSubdomains,
+		"with_subdomains":  MatchWithSubdomains,
+		"WITH-SUBDOMAINS":  MatchWithSubdomains,
+		"subdomainsOnly":   MatchSubdomainsOnly,
+		"subdomains_only":  MatchSubdomainsOnly,
+		" subdomainsonly ": MatchSubdomainsOnly,
+	}
+	for input, want := range accepted {
+		got, err := ParseMatchingType(input)
+		if err != nil || got != want {
+			t.Errorf("ParseMatchingType(%q) = (%q, %v), want %q", input, got, err, want)
+		}
+	}
+	for _, input := range []string{"wildcard", "subdomains", "static_only", "nope"} {
+		if _, err := ParseMatchingType(input); err == nil {
+			t.Errorf("expected %q to be rejected", input)
+		}
+	}
+}
+
+func TestMatchingTypePredicates(t *testing.T) {
+	tests := []struct {
+		value      MatchingType
+		exact      bool
+		subdomains bool
+	}{
+		{"", true, false},
+		{MatchExact, true, false},
+		{MatchWithSubdomains, true, true},
+		{MatchSubdomainsOnly, false, true},
+	}
+	for _, tt := range tests {
+		if got := tt.value.MatchesExactly(); got != tt.exact {
+			t.Errorf("%q.MatchesExactly() = %v, want %v", tt.value, got, tt.exact)
+		}
+		if got := tt.value.MatchesSubdomains(); got != tt.subdomains {
+			t.Errorf("%q.MatchesSubdomains() = %v, want %v", tt.value, got, tt.subdomains)
+		}
+	}
+}
+
+func TestLoadRejectsRemovedMatchSubDomains(t *testing.T) {
+	dir := t.TempDir()
+	main := writeFile(t, dir, "config.yaml", `
+upstreams: [udp://1.1.1.1:53]
+outputs:
+  - {type: file, id: f, path: ./data, listName: l}
+domains:
+  - domain: example.com
+    matchSubDomains: true
+`)
+	_, err := Load(main)
+	if err == nil {
+		t.Fatal("expected the removed field to be rejected")
+	}
+	for _, want := range []string{"matchSubDomains", "matchingType", "withSubdomains"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestLoadRejectsUnknownMatchingType(t *testing.T) {
+	dir := t.TempDir()
+	main := writeFile(t, dir, "config.yaml", `
+upstreams: [udp://1.1.1.1:53]
+outputs:
+  - {type: file, id: f, path: ./data, listName: l}
+domains:
+  - domain: example.com
+    matchingType: wildcard
+`)
+	_, err := Load(main)
+	if err == nil || !strings.Contains(err.Error(), "unsupported matchingType") {
+		t.Errorf("expected an enum error, got %v", err)
+	}
+}
+
+func TestRecordsRejectCNAMEList(t *testing.T) {
+	dir := t.TempDir()
+	write := func(records string) error {
+		main := writeFile(t, dir, "config.yaml", `
+upstreams: [udp://1.1.1.1:53]
+outputs:
+  - {type: file, id: f, path: ./data, listName: l}
+domains:
+  - domain: alias.example.com
+    records:
+`+records)
+		_, err := Load(main)
+		return err
+	}
+
+	for _, form := range []string{
+		"      CNAME: [target.example.com]\n",
+		"      CNAME:\n        - target.example.com\n",
+		"      cname: [target.example.com]\n",
+	} {
+		err := write(form)
+		if err == nil || !strings.Contains(err.Error(), "takes a single value") {
+			t.Errorf("expected a list CNAME to be rejected for %q, got %v", form, err)
+		}
+	}
+
+	if err := write("      CNAME: target.example.com\n"); err != nil {
+		t.Errorf("expected the scalar form to be accepted, got %v", err)
+	}
+}
+
+// Only CNAME is restricted; the rest may repeat on a name.
+func TestRecordsAllowMultipleTXT(t *testing.T) {
+	dir := t.TempDir()
+	main := writeFile(t, dir, "config.yaml", `
+upstreams: [udp://1.1.1.1:53]
+outputs:
+  - {type: file, id: f, path: ./data, listName: l}
+domains:
+  - domain: example.com
+    records:
+      TXT:
+        - "v=spf1 -all"
+        - "google-site-verification=abc"
+      A: [1.2.3.4, 5.6.7.8]
+`)
+	cfg, err := Load(main)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	records := cfg.Domains[0].Records
+	if len(records["TXT"]) != 2 {
+		t.Errorf("expected both TXT values, got %v", records["TXT"])
+	}
+	if len(records["A"]) != 2 {
+		t.Errorf("expected both A values, got %v", records["A"])
 	}
 }

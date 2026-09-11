@@ -27,22 +27,22 @@ fallbackUpstreams:
 
 domains:
   - domain: google.com
-    matchSubDomains: true
+    matchingType: withSubdomains
     maxDepth: ~
     listName: google
   - domain: openai.com
-    matchSubDomains: true
+    matchingType: withSubdomains
     listName: openai
     upstreamsOverride:
       - tls://one.one.one.one
       - https://one.one.one.one/dns-query
   - domain: example.com
-    matchSubDomains: false
+    matchingType: exact
     disableFallback: false
     upstreamsBlacklist:
       - https://dns.google/dns-query
   - domain: static.example.com
-    matchSubDomains: true
+    matchingType: withSubdomains
     maxDepth: 1
     listName: static
     recordsTTL: 5m
@@ -56,7 +56,7 @@ domains:
   - domain: alias.example.com
     listName: alias
     records:
-      CNAME: [google.com]
+      CNAME: google.com
 
 outputs:
   - type: rosApiAddressList

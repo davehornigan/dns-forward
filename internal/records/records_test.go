@@ -117,3 +117,16 @@ func TestCompileEmpty(t *testing.T) {
 		t.Errorf("expected no set, got %v", set)
 	}
 }
+
+func TestCompileRejectsSelfCNAME(t *testing.T) {
+	for _, target := range []string{"example.com", "example.com.", "EXAMPLE.COM"} {
+		_, err := Compile("example.com", map[string][]string{"CNAME": {target}}, 0)
+		if err == nil {
+			t.Errorf("expected a self-referencing CNAME %q to be rejected", target)
+		}
+	}
+	// A different name is still fine.
+	if _, err := Compile("example.com", map[string][]string{"CNAME": {"other.example.com"}}, 0); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}

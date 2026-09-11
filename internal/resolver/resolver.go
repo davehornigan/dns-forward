@@ -271,7 +271,7 @@ const staticUpstreamLabel = "static"
 
 // staticResponse answers from preconfigured records when the rule covers the
 // queried name and type. Records apply to the rule's domain and, when the rule
-// sets matchSubDomains, to every subdomain it covers. The returned channel
+// matches subdomains, to every subdomain it covers. The returned channel
 // feeds outputs the same way upstream answers do; it is nil when there is
 // nothing to emit. When the rule has no record of the queried type, ok is
 // false and the query is forwarded, unless the rule sets recordsOnly.
@@ -285,10 +285,10 @@ func (r *Resolver) staticResponse(req *dns.Msg, rule config.DomainRule, set *rec
 		return nil, nil, false
 	}
 
-	answers := set.Answer(q.Name, q.Qtype)
+	answers := dropSelfCNAMEs(set.Answer(q.Name, q.Qtype), q.Name)
 	chased := false
 	if len(answers) == 0 && (q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA) {
-		if cname := set.CNAME(q.Name); cname != nil {
+		if cname := set.CNAME(q.Name); cname != nil && !isSelfCNAME(cname, q.Name) {
 			answers = append(answers, cname)
 			chased = true
 		}
@@ -319,6 +319,33 @@ func (r *Resolver) staticResponse(req *dns.Msg, rule config.DomainRule, set *rec
 	resp.Answer = append(resp.Answer, targetResp.Answer...)
 	resp.Rcode = targetResp.Rcode
 	return resp, targetCh, true
+}
+
+// isSelfCNAME reports whether the record sends the resolver back to the name it
+// just asked about. A rule matching subdomains can produce one even when the
+// config looked fine, because the record answers under the queried name: a
+// `CNAME: [www.example.com]` on a rule covering example.com and its subdomains
+// becomes `www.example.com -> www.example.com` for that subdomain.
+func isSelfCNAME(cname *dns.CNAME, qname string) bool {
+	if cname == nil {
+		return false
+	}
+	if !strings.EqualFold(cname.Target, dns.Fqdn(qname)) {
+		return false
+	}
+	slog.Warn("static CNAME points at the queried name, ignoring", "qname", qname, "target", cname.Target)
+	return true
+}
+
+func dropSelfCNAMEs(answers []dns.RR, qname string) []dns.RR {
+	kept := answers[:0]
+	for _, rr := range answers {
+		if cname, ok := rr.(*dns.CNAME); ok && isSelfCNAME(cname, qname) {
+			continue
+		}
+		kept = append(kept, rr)
+	}
+	return kept
 }
 
 func (r *Resolver) resolveCNAMETarget(target string, qtype uint16, rule config.DomainRule, upstreamsList []upstreams.Upstream) (*dns.Msg, <-chan *dns.Msg) {
@@ -910,11 +937,15 @@ func (r *Resolver) matchDomain(qname string) (bool, config.DomainRule, int) {
 	return false, config.DomainRule{}, -1
 }
 
-// indexExactRules maps each rule's domain to the first rule naming it, so an
-// exact match never needs a scan.
+// indexExactRules maps each domain to the first rule that applies to the domain
+// itself, so an exact match never needs a scan. Rules matching only subdomains
+// are left out: they must not answer for the domain they are named after.
 func indexExactRules(rules []config.DomainRule) map[string]int {
 	index := make(map[string]int, len(rules))
 	for i, rule := range rules {
+		if !rule.MatchingType.MatchesExactly() {
+			continue
+		}
 		domain := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(rule.Domain)), ".")
 		if domain == "" {
 			continue
@@ -933,11 +964,11 @@ func ruleCoversName(rule config.DomainRule, name string) bool {
 }
 
 func ruleMatchesExactly(rule config.DomainRule, name string) bool {
-	return rule.Domain != "" && name == rule.Domain
+	return rule.Domain != "" && rule.MatchingType.MatchesExactly() && name == rule.Domain
 }
 
 func ruleCoversSubdomain(rule config.DomainRule, name string) bool {
-	if rule.Domain == "" || !rule.MatchSubDomains {
+	if rule.Domain == "" || !rule.MatchingType.MatchesSubdomains() {
 		return false
 	}
 	if !strings.HasSuffix(name, "."+rule.Domain) {
