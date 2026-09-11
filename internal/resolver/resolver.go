@@ -38,6 +38,7 @@ type Resolver struct {
 	upstreams         []upstreams.Upstream
 	fallbackUpstreams []upstreams.Upstream
 	rules             []config.DomainRule
+	exactRules        map[string]int
 	ruleUpstreams     map[int][]upstreams.Upstream
 	ruleRecords       map[int]*records.Set
 	outputs           []OutputTarget
@@ -74,6 +75,7 @@ func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, 
 		upstreams:         upstreamsList,
 		fallbackUpstreams: fallbackList,
 		rules:             rules,
+		exactRules:        indexExactRules(rules),
 		ruleUpstreams:     ruleUpstreams,
 		ruleRecords:       ruleRecords,
 		outputs:           outputsList,
@@ -885,30 +887,60 @@ func (r *Resolver) fallbackCacheSet(req *dns.Msg, resp *dns.Msg) {
 	r.fallbackMu.Unlock()
 }
 
+// matchDomain picks the rule for a query name. A rule naming the domain exactly
+// always wins over one that only covers it as a subdomain, whatever order they
+// appear in; among rules of the same kind the first one in the config wins.
 func (r *Resolver) matchDomain(qname string) (bool, config.DomainRule, int) {
 	if len(r.rules) == 0 {
 		return true, config.DomainRule{}, -1
 	}
 	name := strings.TrimSuffix(strings.ToLower(qname), ".")
 
+	// Exact names are indexed, so the common case is a single map lookup and no
+	// scan at all. Only a name without an exact rule walks the list, and that
+	// walk stops at the first subdomain rule covering it.
+	if i, ok := r.exactRules[name]; ok {
+		return true, r.rules[i], i
+	}
 	for i, rule := range r.rules {
-		if ruleCoversName(rule, name) {
+		if ruleCoversSubdomain(rule, name) {
 			return true, rule, i
 		}
 	}
 	return false, config.DomainRule{}, -1
 }
 
-// ruleCoversName reports whether the rule applies to name, which must be
-// lowercase and without a trailing dot.
+// indexExactRules maps each rule's domain to the first rule naming it, so an
+// exact match never needs a scan.
+func indexExactRules(rules []config.DomainRule) map[string]int {
+	index := make(map[string]int, len(rules))
+	for i, rule := range rules {
+		domain := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(rule.Domain)), ".")
+		if domain == "" {
+			continue
+		}
+		if _, exists := index[domain]; !exists {
+			index[domain] = i
+		}
+	}
+	return index
+}
+
+// ruleCoversName reports whether the rule applies to name at all, either
+// exactly or as a subdomain. name must be lowercase and without a trailing dot.
 func ruleCoversName(rule config.DomainRule, name string) bool {
-	if rule.Domain == "" {
+	return ruleMatchesExactly(rule, name) || ruleCoversSubdomain(rule, name)
+}
+
+func ruleMatchesExactly(rule config.DomainRule, name string) bool {
+	return rule.Domain != "" && name == rule.Domain
+}
+
+func ruleCoversSubdomain(rule config.DomainRule, name string) bool {
+	if rule.Domain == "" || !rule.MatchSubDomains {
 		return false
 	}
-	if name == rule.Domain {
-		return true
-	}
-	if !rule.MatchSubDomains || !strings.HasSuffix(name, "."+rule.Domain) {
+	if !strings.HasSuffix(name, "."+rule.Domain) {
 		return false
 	}
 	if rule.MaxDepth == nil {

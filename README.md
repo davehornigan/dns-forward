@@ -160,6 +160,7 @@ Upstreams:
 - `fallbackUpstreams` are only used when no primary upstream returns an address, and their answers are not written to address lists. If omitted, defaults to `udp://1.1.1.1:53`.
 
 Domains:
+- A rule naming the queried domain exactly always wins over a rule that only covers it through `matchSubDomains`, whatever order they appear in. Among rules of the same kind the first one in the config wins, so put narrower subdomain rules above broader ones. A name that falls outside one rule's `maxDepth` can still be picked up by a broader rule further down.
 - `domains[].listName` overrides the output list name for all outputs; otherwise each output uses its own `listName`.
 - `domains[].outputs` controls which outputs are used by ID. If omitted or null, all outputs are used. If empty, nothing is written.
 - `domains[].upstreamsOverride` overrides the primary upstream list for matching domains; if omitted, global `upstreams` are used. Fallback upstreams are always shared.

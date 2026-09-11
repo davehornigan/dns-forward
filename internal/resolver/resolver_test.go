@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/davehornigan/dns-forward/internal/config"
@@ -62,6 +63,82 @@ func TestRuleCoversName(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// An exact rule beats a subdomain rule no matter which is declared first.
+func TestMatchDomainPrefersExactRule(t *testing.T) {
+	exact := config.DomainRule{Domain: "api.example.com", ListName: "exact"}
+	wildcard := config.DomainRule{Domain: "example.com", MatchSubDomains: true, ListName: "wildcard"}
+
+	orders := map[string][]config.DomainRule{
+		"wildcard declared first": {wildcard, exact},
+		"exact declared first":    {exact, wildcard},
+	}
+	for name, rules := range orders {
+		t.Run(name, func(t *testing.T) {
+			res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil)
+
+			match, rule, _ := res.matchDomain("api.example.com.")
+			if !match || rule.ListName != "exact" {
+				t.Errorf("expected the exact rule for api.example.com, got %q", rule.ListName)
+			}
+			// Names the exact rule does not name still fall to the wildcard.
+			for _, qname := range []string{"www.example.com.", "example.com."} {
+				match, rule, _ = res.matchDomain(qname)
+				if !match || rule.ListName != "wildcard" {
+					t.Errorf("expected the wildcard rule for %s, got %q", qname, rule.ListName)
+				}
+			}
+		})
+	}
+}
+
+// Exactness wins over declaration order, but a deeper subdomain rule does not:
+// among subdomain rules the config order still decides.
+func TestMatchDomainKeepsOrderAmongSubdomainRules(t *testing.T) {
+	broad := config.DomainRule{Domain: "example.com", MatchSubDomains: true, ListName: "broad"}
+	deep := config.DomainRule{Domain: "api.example.com", MatchSubDomains: true, ListName: "deep"}
+
+	res := New(nil, nil, []config.DomainRule{broad, deep}, nil, nil, nil, nil, 0, 0, 0, false, nil)
+	if _, rule, _ := res.matchDomain("v1.api.example.com."); rule.ListName != "broad" {
+		t.Errorf("expected the first subdomain rule, got %q", rule.ListName)
+	}
+	// The exact name of the deeper rule still reaches it.
+	if _, rule, _ := res.matchDomain("api.example.com."); rule.ListName != "deep" {
+		t.Errorf("expected the exact rule, got %q", rule.ListName)
+	}
+}
+
+// Among several rules naming the same domain, the first one still wins.
+func TestMatchDomainFirstExactRuleWins(t *testing.T) {
+	rules := []config.DomainRule{
+		{Domain: "", ListName: "ignored"},
+		{Domain: "example.com", ListName: "first"},
+		{Domain: "example.com", ListName: "second"},
+	}
+	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil)
+	match, rule, index := res.matchDomain("example.com.")
+	if !match || rule.ListName != "first" || index != 1 {
+		t.Errorf("matchDomain = (%v, %q, %d), want (true, \"first\", 1)", match, rule.ListName, index)
+	}
+}
+
+// config.Load normalizes domains, but the index must not depend on that.
+func TestIndexExactRulesNormalizes(t *testing.T) {
+	index := indexExactRules([]config.DomainRule{
+		{Domain: " Example.COM. "},
+		{Domain: ""},
+		{Domain: "other.org"},
+	})
+	if got, ok := index["example.com"]; !ok || got != 0 {
+		t.Errorf("expected example.com at 0, got (%d, %v)", got, ok)
+	}
+	if _, ok := index[""]; ok {
+		t.Error("expected empty domains to be skipped")
+	}
+	if len(index) != 2 {
+		t.Errorf("unexpected index %v", index)
 	}
 }
 
@@ -198,5 +275,40 @@ func TestStaticResponseIgnoresNonINETClass(t *testing.T) {
 	req.Question[0].Qclass = dns.ClassCHAOS
 	if _, _, ok := res.staticResponse(req, rule, set, nil); ok {
 		t.Error("expected non-INET classes to be forwarded")
+	}
+}
+
+func benchmarkRules(n int) []config.DomainRule {
+	rules := make([]config.DomainRule, 0, n+1)
+	for i := 0; i < n; i++ {
+		rules = append(rules, config.DomainRule{Domain: fmt.Sprintf("domain%d.example", i)})
+	}
+	rules = append(rules, config.DomainRule{Domain: "catchall.example", MatchSubDomains: true})
+	return rules
+}
+
+// The exact hit is the common case and must not depend on list length.
+func BenchmarkMatchDomainExact(b *testing.B) {
+	for _, n := range []int{10, 1000} {
+		b.Run(fmt.Sprintf("rules=%d", n), func(b *testing.B) {
+			res := New(nil, nil, benchmarkRules(n), nil, nil, nil, nil, 0, 0, 0, false, nil)
+			qname := fmt.Sprintf("domain%d.example.", n-1)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				res.matchDomain(qname)
+			}
+		})
+	}
+}
+
+func BenchmarkMatchDomainSubdomain(b *testing.B) {
+	for _, n := range []int{10, 1000} {
+		b.Run(fmt.Sprintf("rules=%d", n), func(b *testing.B) {
+			res := New(nil, nil, benchmarkRules(n), nil, nil, nil, nil, 0, 0, 0, false, nil)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				res.matchDomain("www.catchall.example.")
+			}
+		})
 	}
 }
