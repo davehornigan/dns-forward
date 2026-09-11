@@ -1,6 +1,7 @@
 package outputs
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -394,5 +395,39 @@ func TestNormalizeListNames(t *testing.T) {
 	got := normalizeListNames([]string{" blocked ", "", "blocked", "other", "   "})
 	if len(got) != 2 || got[0] != "blocked" || got[1] != "other" {
 		t.Errorf("unexpected result %v", got)
+	}
+}
+
+func TestAddressFamily(t *testing.T) {
+	tests := map[string]string{
+		"1.2.3.4":              familyIPv4,
+		"10.0.0.0/8":           familyIPv4,
+		"1.2.3.4/32":           familyIPv4,
+		"example.com":          familyIPv4, // recordType: host writes a DNS name
+		"":                     familyIPv4,
+		"2606:4700:4700::1111": familyIPv6,
+		"2606:4700::/32":       familyIPv6,
+		"fe80::1/128":          familyIPv6,
+		"::1":                  familyIPv6,
+	}
+	for address, want := range tests {
+		if got := addressFamily(address); got != want {
+			t.Errorf("addressFamily(%q) = %q, want %q", address, got, want)
+		}
+	}
+}
+
+func TestIsDuplicateEntryErr(t *testing.T) {
+	if !isDuplicateEntryErr(errors.New("routeros rest status 400 Bad Request: failure: already have such entry")) {
+		t.Error("expected the REST duplicate error to be recognised")
+	}
+	if !isDuplicateEntryErr(errors.New("from RouterOS device: already have such entry")) {
+		t.Error("expected the API duplicate error to be recognised")
+	}
+	if isDuplicateEntryErr(errors.New("connection refused")) {
+		t.Error("an unrelated error is not a duplicate")
+	}
+	if isDuplicateEntryErr(nil) {
+		t.Error("nil is not a duplicate")
 	}
 }

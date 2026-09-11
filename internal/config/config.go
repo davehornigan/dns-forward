@@ -31,6 +31,8 @@ type ServerConfig struct {
 	ExcludeSubnets    []string      `yaml:"excludeSubnets"`
 	WriteIPWithPrefix bool          `yaml:"writeIPWithPrefix"`
 	ResolveAllOnStart bool          `yaml:"resolveAllDomainsOnStart"`
+	CacheSize         *int          `yaml:"cacheSize"`
+	NegativeTTL       time.Duration `yaml:"negativeTTL"`
 }
 
 type OutputConfig struct {

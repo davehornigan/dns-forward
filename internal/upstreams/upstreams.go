@@ -3,7 +3,6 @@ package upstreams
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -177,17 +176,6 @@ func Labels(upstreams []Upstream) []string {
 		out = append(out, Label(upstream))
 	}
 	return out
-}
-
-func ExchangeDoT(ctx context.Context, upstream Upstream, req *dns.Msg, timeout time.Duration) (*dns.Msg, time.Duration, error) {
-	client := &dns.Client{
-		Net: "tcp-tls",
-		TLSConfig: &tls.Config{
-			ServerName: upstream.ServerNI,
-		},
-		Timeout: timeout,
-	}
-	return client.ExchangeContext(ctx, req, upstream.Address)
 }
 
 func ExchangeDNS(ctx context.Context, network, address string, req *dns.Msg, timeout time.Duration) (*dns.Msg, time.Duration, error) {

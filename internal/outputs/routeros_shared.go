@@ -85,6 +85,48 @@ func (l *routerLimiter) pace() {
 	}
 }
 
+// RouterOS keeps two separate address lists. /ip/firewall/address-list holds
+// IPv4 and DNS names only; an IPv6 address put there is rejected as "not a
+// valid dns name", because the router tries to read it as a hostname.
+const (
+	familyIPv4 = "ip"
+	familyIPv6 = "ipv6"
+)
+
+// addressFamilies are the menus a list name can span, in a stable order.
+var addressFamilies = []string{familyIPv4, familyIPv6}
+
+// addressFamily says which of the router's two address lists an entry belongs
+// in. Anything that is not an IPv6 literal — an IPv4 address, a CIDR, or a DNS
+// name written by recordType: host — belongs to the IPv4 list.
+func addressFamily(address string) string {
+	ip := parseAddressIP(address)
+	if ip != nil && ip.To4() == nil {
+		return familyIPv6
+	}
+	return familyIPv4
+}
+
+// isMissingMenuErr reports whether the router does not know the menu at all,
+// which is what a device with the IPv6 package disabled answers.
+func isMissingMenuErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "no such command") || strings.Contains(lower, "no such item")
+}
+
+// isDuplicateEntryErr reports whether the router refused a write because the
+// entry is already there. Several replicas writing the same resolved address
+// race each other, and losing that race is success: the entry exists.
+func isDuplicateEntryErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "already have such entry")
+}
+
 // listEntry is one address-list row as the router reports it.
 type listEntry struct {
 	id      string

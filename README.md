@@ -60,6 +60,8 @@ server:
   debug: false
   writeIPWithPrefix: false
   resolveAllDomainsOnStart: false
+  cacheSize: 10000
+  negativeTTL: 30s
   excludeSubnets:
     - 10.0.0.0/8
     - 192.168.0.0/16
@@ -152,6 +154,13 @@ Server:
 - `server.writeIPWithPrefix` writes resolved IPs as `/32` (IPv4) or `/128` (IPv6).
 - `server.resolveAllDomainsOnStart` resolves each configured domain at startup (A and AAAA) and emits results to outputs.
 - `server.excludeSubnets` drops resolved IPs within these CIDRs before writing to outputs.
+- `server.cacheSize` bounds the response cache in entries (default `10000`, `0` disables it). Answers are reused until their TTL runs out, and the TTL handed to the client counts down so nobody caches longer than the origin allowed. Failures are never cached.
+- `server.negativeTTL` caps how long NXDOMAIN and empty answers are kept (default `30s`). A shorter SOA lifetime in the response wins over this cap.
+
+Performance notes:
+- Repeated queries are served from cache without touching an upstream.
+- DoT upstreams reuse their TLS connections instead of handshaking per query, and keep a TLS session cache so even a fresh connection resumes rather than running a full handshake.
+- When a primary upstream answers without an address, the fallback starts immediately and runs alongside the primaries still in flight, instead of waiting for all of them to finish first.
 
 Upstreams:
 - DoH upstreams require a full path (e.g. `https://dns.google/query`).
@@ -194,6 +203,10 @@ Outputs:
 - `rosRestApiAddressList` sends requests over REST with basic auth. `host` supports optional scheme/port; only `http`/`https` are supported. If omitted, `http` is assumed. When `useTLS` or `port` are omitted, they inherit from the host URL. Default ports are `80` (HTTP) and `443` (HTTPS).
 - `rosRestApiAddressList.connectionAttempts` controls initial connection retries (default `3`).
 - `rosRestApiAddressList.reconnectionAttempts` controls retries after a REST request failure; if omitted, it inherits `connectionAttempts`.
+
+RouterOS address lists (both `rosApiAddressList` and `rosRestApiAddressList`):
+- IPv4 addresses, CIDRs and `recordType: host` names go to `/ip/firewall/address-list`; IPv6 addresses go to `/ipv6/firewall/address-list`. The IPv4 menu rejects an IPv6 literal as `not a valid dns name`, so the family is chosen per address. A list name spans both menus, and reads cover both. A router without the IPv6 package is fine: the missing menu is skipped.
+- Running several replicas against one router is safe. They race on the same resolved address, and the loser gets `already have such entry`, which is treated as success — the entry exists, so its id is adopted instead of reporting an error.
 
 RouterOS traffic (both `rosApiAddressList` and `rosRestApiAddressList`):
 - Address lists are read in bulk: one request per list caches every entry's id, comment and remaining timeout. Addresses already on the router then cost no requests at all, and a new address costs a single write — its id comes back in the create response.

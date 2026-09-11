@@ -101,7 +101,7 @@ func TestMatchDomainPrefersExactRule(t *testing.T) {
 	}
 	for name, rules := range orders {
 		t.Run(name, func(t *testing.T) {
-			res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil)
+			res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
 
 			match, rule, _ := res.matchDomain("api.example.com.")
 			if !match || rule.ListName != "exact" {
@@ -124,7 +124,7 @@ func TestMatchDomainKeepsOrderAmongSubdomainRules(t *testing.T) {
 	broad := config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains, ListName: "broad"}
 	deep := config.DomainRule{Domain: "api.example.com", MatchingType: config.MatchWithSubdomains, ListName: "deep"}
 
-	res := New(nil, nil, []config.DomainRule{broad, deep}, nil, nil, nil, nil, 0, 0, 0, false, nil)
+	res := New(nil, nil, []config.DomainRule{broad, deep}, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
 	if _, rule, _ := res.matchDomain("v1.api.example.com."); rule.ListName != "broad" {
 		t.Errorf("expected the first subdomain rule, got %q", rule.ListName)
 	}
@@ -140,7 +140,7 @@ func TestMatchDomainSubdomainsOnlySkipsApex(t *testing.T) {
 	rules := []config.DomainRule{
 		{Domain: "example.com", MatchingType: config.MatchSubdomainsOnly, ListName: "subs"},
 	}
-	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil)
+	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
 
 	if match, _, _ := res.matchDomain("example.com."); match {
 		t.Error("expected the apex to be unmatched")
@@ -156,7 +156,7 @@ func TestMatchDomainSubdomainsOnlyAlongsideExact(t *testing.T) {
 		{Domain: "example.com", MatchingType: config.MatchSubdomainsOnly, ListName: "subs"},
 		{Domain: "example.com", MatchingType: config.MatchExact, ListName: "apex"},
 	}
-	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil)
+	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
 
 	if _, rule, index := res.matchDomain("example.com."); rule.ListName != "apex" || index != 1 {
 		t.Errorf("expected the exact rule for the apex, got (%q, %d)", rule.ListName, index)
@@ -173,7 +173,7 @@ func TestMatchDomainFirstExactRuleWins(t *testing.T) {
 		{Domain: "example.com", ListName: "first"},
 		{Domain: "example.com", ListName: "second"},
 	}
-	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil)
+	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
 	match, rule, index := res.matchDomain("example.com.")
 	if !match || rule.ListName != "first" || index != 1 {
 		t.Errorf("matchDomain = (%v, %q, %d), want (true, \"first\", 1)", match, rule.ListName, index)
@@ -201,7 +201,7 @@ func TestIndexExactRulesNormalizes(t *testing.T) {
 func TestMatchDomainFallsThroughToBroaderRule(t *testing.T) {
 	narrow := config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains, MaxDepth: intPtr(1), ListName: "narrow"}
 	broad := config.DomainRule{Domain: "example.com", MatchingType: config.MatchWithSubdomains, ListName: "broad"}
-	res := New(nil, nil, []config.DomainRule{narrow, broad}, nil, nil, nil, nil, 0, 0, 0, false, nil)
+	res := New(nil, nil, []config.DomainRule{narrow, broad}, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
 
 	tests := map[string]struct {
 		match bool
@@ -224,7 +224,7 @@ func TestMatchDomainFallsThroughToBroaderRule(t *testing.T) {
 }
 
 func TestMatchDomainWithoutRulesMatchesEverything(t *testing.T) {
-	res := New(nil, nil, nil, nil, nil, nil, nil, 0, 0, 0, false, nil)
+	res := New(nil, nil, nil, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
 	match, _, index := res.matchDomain("anything.example.org.")
 	if !match || index != -1 {
 		t.Errorf("expected a catch-all match with index -1, got (%v, %d)", match, index)
@@ -237,7 +237,7 @@ func newResolverWithRecords(t *testing.T, rule config.DomainRule, raw map[string
 	if err != nil {
 		t.Fatalf("compile records: %v", err)
 	}
-	res := New(nil, nil, []config.DomainRule{rule}, nil, map[int]*records.Set{0: set}, nil, nil, 0, 0, 0, false, nil)
+	res := New(nil, nil, []config.DomainRule{rule}, nil, map[int]*records.Set{0: set}, nil, nil, 0, 0, 0, false, nil, -1, 0)
 	return res, set
 }
 
@@ -390,7 +390,7 @@ func benchmarkRules(n int) []config.DomainRule {
 func BenchmarkMatchDomainExact(b *testing.B) {
 	for _, n := range []int{10, 1000} {
 		b.Run(fmt.Sprintf("rules=%d", n), func(b *testing.B) {
-			res := New(nil, nil, benchmarkRules(n), nil, nil, nil, nil, 0, 0, 0, false, nil)
+			res := New(nil, nil, benchmarkRules(n), nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
 			qname := fmt.Sprintf("domain%d.example.", n-1)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
@@ -403,7 +403,7 @@ func BenchmarkMatchDomainExact(b *testing.B) {
 func BenchmarkMatchDomainSubdomain(b *testing.B) {
 	for _, n := range []int{10, 1000} {
 		b.Run(fmt.Sprintf("rules=%d", n), func(b *testing.B) {
-			res := New(nil, nil, benchmarkRules(n), nil, nil, nil, nil, 0, 0, 0, false, nil)
+			res := New(nil, nil, benchmarkRules(n), nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				res.matchDomain("www.catchall.example.")

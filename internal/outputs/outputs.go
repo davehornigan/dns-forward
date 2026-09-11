@@ -314,7 +314,7 @@ func FormatRouterOSAddress(cfg RosApiAccessConfig) string {
 
 func (c *RouterOSClient) findAddressID(listName, address string) (string, error) {
 	args := []string{
-		"/ip/firewall/address-list/print",
+		"/" + addressFamily(address) + "/firewall/address-list/print",
 		fmt.Sprintf("?list=%s", listName),
 		fmt.Sprintf("?address=%s", address),
 		"=.proplist=.id,address",
@@ -344,27 +344,34 @@ func (c *RouterOSClient) snapshotList(listName string, onlyIfMissing bool) error
 		return nil
 	}
 
-	reply, err := c.runArgs([]string{
-		"/ip/firewall/address-list/print",
-		fmt.Sprintf("?list=%s", listName),
-		"=.proplist=.id,address,comment,timeout",
-	})
-	if err != nil {
-		c.cache.releaseSnapshot(listName)
-		return err
-	}
-	entries := make([]listEntry, 0, len(reply.Re))
-	for _, re := range reply.Re {
-		address := strings.TrimSpace(re.Map["address"])
-		if address == "" {
-			continue
-		}
-		entries = append(entries, listEntry{
-			id:      strings.TrimSpace(re.Map[".id"]),
-			address: address,
-			comment: re.Map["comment"],
-			timeout: re.Map["timeout"],
+	// A list name spans both menus, so both are read and merged.
+	var entries []listEntry
+	for _, family := range addressFamilies {
+		reply, err := c.runArgs([]string{
+			"/" + family + "/firewall/address-list/print",
+			fmt.Sprintf("?list=%s", listName),
+			"=.proplist=.id,address,comment,timeout",
 		})
+		if err != nil {
+			if family == familyIPv6 && isMissingMenuErr(err) {
+				// The router has no IPv6 menu; nothing to read there.
+				continue
+			}
+			c.cache.releaseSnapshot(listName)
+			return err
+		}
+		for _, re := range reply.Re {
+			address := strings.TrimSpace(re.Map["address"])
+			if address == "" {
+				continue
+			}
+			entries = append(entries, listEntry{
+				id:      strings.TrimSpace(re.Map[".id"]),
+				address: address,
+				comment: re.Map["comment"],
+				timeout: re.Map["timeout"],
+			})
+		}
 	}
 	restore := c.cache.applySnapshot(listName, entries)
 	c.cache.releaseSnapshot(listName)
@@ -415,7 +422,7 @@ func (c *RouterOSClient) storeEntry(listName, address, id, comment, timeout stri
 
 func (c *RouterOSClient) addAddress(listName, domain, address, timeout string) (string, error) {
 	args := []string{
-		"/ip/firewall/address-list/add",
+		"/" + addressFamily(address) + "/firewall/address-list/add",
 		fmt.Sprintf("=list=%s", listName),
 		fmt.Sprintf("=address=%s", address),
 		fmt.Sprintf("=comment=%s", domain),
@@ -425,6 +432,11 @@ func (c *RouterOSClient) addAddress(listName, domain, address, timeout string) (
 	}
 	reply, err := c.runArgs(args)
 	if err != nil {
+		// Another replica may have written the same address first; adopting
+		// its entry is the correct outcome, not an error.
+		if isDuplicateEntryErr(err) {
+			return c.findAddressID(listName, address)
+		}
 		return "", err
 	}
 	// `add` reports the new id in the !done sentence, so no follow-up lookup.
@@ -445,7 +457,7 @@ func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *st
 
 	c.cache.trackList(listName)
 	if entry, ok := c.cache.lookup(key); ok {
-		return c.refreshTTL(key, entry, effectiveTTL, updateTTL)
+		return c.refreshTTL(key, address, entry, effectiveTTL, updateTTL)
 	}
 	if !c.cache.claim(key) {
 		return nil
@@ -458,7 +470,7 @@ func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *st
 		slog.Warn("routeros list snapshot failed", "list", listName, "error", err)
 	}
 	if entry, ok := c.cache.lookup(key); ok {
-		return c.refreshTTL(key, entry, effectiveTTL, updateTTL)
+		return c.refreshTTL(key, address, entry, effectiveTTL, updateTTL)
 	}
 	if c.cache.coveredBySubnet(listName, address) {
 		return nil
@@ -474,14 +486,14 @@ func (c *RouterOSClient) EnsureAddress(listName, domain, address string, ttl *st
 
 // refreshTTL rewrites an entry's timeout only when it is close to expiry, so a
 // busy domain does not produce a router write on every single query.
-func (c *RouterOSClient) refreshTTL(key string, entry cachedEntry, wantedTTL string, updateTTL *bool) error {
+func (c *RouterOSClient) refreshTTL(key, address string, entry cachedEntry, wantedTTL string, updateTTL *bool) error {
 	if wantedTTL == "" || !shouldUpdateTTL(c.cfg.UpdateTTL, updateTTL) {
 		return nil
 	}
 	if !needsTTLRefresh(entry, wantedTTL) {
 		return nil
 	}
-	if err := c.updateAddressTTL(entry.id, wantedTTL); err != nil {
+	if err := c.updateAddressTTL(addressFamily(address), entry.id, wantedTTL); err != nil {
 		return err
 	}
 	parsed, known := parseRouterOSDuration(wantedTTL)
@@ -513,9 +525,9 @@ func addReplyID(reply *routeros.Reply) string {
 	return ""
 }
 
-func (c *RouterOSClient) updateAddressTTL(id, ttl string) error {
+func (c *RouterOSClient) updateAddressTTL(family, id, ttl string) error {
 	_, err := c.runArgs([]string{
-		"/ip/firewall/address-list/set",
+		"/" + family + "/firewall/address-list/set",
 		fmt.Sprintf("=.id=%s", id),
 		fmt.Sprintf("=timeout=%s", ttl),
 	})

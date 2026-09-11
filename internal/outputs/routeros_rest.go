@@ -131,7 +131,7 @@ func NewRouterOSRestClient(cfg RosRestApiAddressListConfig, timeout time.Duratio
 	rest := &RouterOSRestClient{
 		cfg:                  cfg,
 		client:               client,
-		baseURL:              baseURL + "/rest/ip/firewall/address-list",
+		baseURL:              baseURL + "/rest",
 		cache:                newAddressCache(),
 		limiter:              newRouterLimiter(maxConcurrent, cfg.MinRequestInterval),
 		timeout:              timeout,
@@ -144,6 +144,17 @@ func NewRouterOSRestClient(cfg RosRestApiAddressListConfig, timeout time.Duratio
 	}
 	rest.startCacheRefresher(refreshInterval(cfg.RefreshInterval))
 	return rest, nil
+}
+
+// listURL points at the address-list menu for an address family. RouterOS keeps
+// IPv4 and IPv6 entries in separate menus, and the IPv4 one rejects an IPv6
+// literal as "not a valid dns name".
+func (c *RouterOSRestClient) listURL(family string) string {
+	return c.baseURL + "/" + family + "/firewall/address-list"
+}
+
+func (c *RouterOSRestClient) addressURL(address string) string {
+	return c.listURL(addressFamily(address))
 }
 
 func (c *RouterOSRestClient) DefaultListName() string {
@@ -169,7 +180,7 @@ func (c *RouterOSRestClient) EnsureAddress(listName, domain, address string, ttl
 
 	c.cache.trackList(listName)
 	if entry, ok := c.cache.lookup(key); ok {
-		return c.refreshTTL(key, entry, effectiveTTL, updateTTL)
+		return c.refreshTTL(key, address, entry, effectiveTTL, updateTTL)
 	}
 	if !c.cache.claim(key) {
 		return nil
@@ -182,7 +193,7 @@ func (c *RouterOSRestClient) EnsureAddress(listName, domain, address string, ttl
 		slog.Warn("routeros rest list snapshot failed", "list", listName, "error", err)
 	}
 	if entry, ok := c.cache.lookup(key); ok {
-		return c.refreshTTL(key, entry, effectiveTTL, updateTTL)
+		return c.refreshTTL(key, address, entry, effectiveTTL, updateTTL)
 	}
 	if c.cache.coveredBySubnet(listName, address) {
 		return nil
@@ -198,14 +209,14 @@ func (c *RouterOSRestClient) EnsureAddress(listName, domain, address string, ttl
 
 // refreshTTL rewrites an entry's timeout only when it is close to expiry, so a
 // busy domain does not produce a router write on every single query.
-func (c *RouterOSRestClient) refreshTTL(key string, entry cachedEntry, wantedTTL string, updateTTL *bool) error {
+func (c *RouterOSRestClient) refreshTTL(key, address string, entry cachedEntry, wantedTTL string, updateTTL *bool) error {
 	if wantedTTL == "" || !shouldUpdateTTL(c.cfg.UpdateTTL, updateTTL) {
 		return nil
 	}
 	if !needsTTLRefresh(entry, wantedTTL) {
 		return nil
 	}
-	if err := c.updateAddressTTL(entry.id, wantedTTL); err != nil {
+	if err := c.updateAddressTTL(addressFamily(address), entry.id, wantedTTL); err != nil {
 		return err
 	}
 	parsed, known := parseRouterOSDuration(wantedTTL)
@@ -216,11 +227,11 @@ func (c *RouterOSRestClient) refreshTTL(key string, entry cachedEntry, wantedTTL
 	return nil
 }
 
-func (c *RouterOSRestClient) updateAddressTTL(id, ttl string) error {
+func (c *RouterOSRestClient) updateAddressTTL(family, id, ttl string) error {
 	if strings.TrimSpace(id) == "" {
 		return errors.New("routeros rest address id is required")
 	}
-	endpoint := c.baseURL + "/" + id
+	endpoint := c.listURL(family) + "/" + id
 	if _, err := c.request(http.MethodPatch, endpoint, map[string]string{
 		"timeout": ttl,
 	}); err == nil {
@@ -229,7 +240,7 @@ func (c *RouterOSRestClient) updateAddressTTL(id, ttl string) error {
 		return err
 	}
 
-	entry, err := c.getAddressEntry(id)
+	entry, err := c.getAddressEntry(family, id)
 	if err != nil {
 		return err
 	}
@@ -277,7 +288,8 @@ func (c *RouterOSRestClient) findAddressID(listName, address string) (string, er
 	query := url.Values{}
 	query.Set("list", listName)
 	query.Set("address", address)
-	endpoint, err := c.withQuery(c.baseURL, query)
+	menu := c.addressURL(address)
+	endpoint, err := c.withQuery(menu, query)
 	if err != nil {
 		return "", err
 	}
@@ -286,7 +298,7 @@ func (c *RouterOSRestClient) findAddressID(listName, address string) (string, er
 		if !isNoSuchCommand(err) {
 			return "", err
 		}
-		body, err = c.request(http.MethodGet, c.baseURL, nil)
+		body, err = c.request(http.MethodGet, menu, nil)
 		if err != nil {
 			return "", err
 		}
@@ -315,26 +327,33 @@ func (c *RouterOSRestClient) snapshotList(listName string, onlyIfMissing bool) e
 		return nil
 	}
 
-	rows, err := c.fetchList(listName)
-	if err != nil {
-		c.cache.releaseSnapshot(listName)
-		return err
-	}
-	entries := make([]listEntry, 0, len(rows))
-	for _, row := range rows {
-		if fmt.Sprint(row["list"]) != listName {
-			continue
+	// A list name spans both menus, so both are read and merged.
+	var entries []listEntry
+	for _, family := range addressFamilies {
+		rows, err := c.fetchList(family, listName)
+		if err != nil {
+			if family == familyIPv6 && isMissingMenuErr(err) {
+				// The router has no IPv6 menu; nothing to read there.
+				continue
+			}
+			c.cache.releaseSnapshot(listName)
+			return err
 		}
-		address := strings.TrimSpace(fmt.Sprint(row["address"]))
-		if address == "" {
-			continue
+		for _, row := range rows {
+			if fmt.Sprint(row["list"]) != listName {
+				continue
+			}
+			address := strings.TrimSpace(fmt.Sprint(row["address"]))
+			if address == "" {
+				continue
+			}
+			entries = append(entries, listEntry{
+				id:      readRestID(row),
+				address: address,
+				comment: readRestString(row, "comment"),
+				timeout: readRestString(row, "timeout"),
+			})
 		}
-		entries = append(entries, listEntry{
-			id:      readRestID(row),
-			address: address,
-			comment: readRestString(row, "comment"),
-			timeout: readRestString(row, "timeout"),
-		})
 	}
 	restore := c.cache.applySnapshot(listName, entries)
 	c.cache.releaseSnapshot(listName)
@@ -348,10 +367,11 @@ func (c *RouterOSRestClient) snapshotList(listName string, onlyIfMissing bool) e
 
 // fetchList reads every row of an address list, falling back to an unfiltered
 // read on RouterOS builds that reject query parameters.
-func (c *RouterOSRestClient) fetchList(listName string) ([]map[string]any, error) {
+func (c *RouterOSRestClient) fetchList(family, listName string) ([]map[string]any, error) {
+	menu := c.listURL(family)
 	query := url.Values{}
 	query.Set("list", listName)
-	endpoint, err := c.withQuery(c.baseURL, query)
+	endpoint, err := c.withQuery(menu, query)
 	if err != nil {
 		return nil, err
 	}
@@ -360,7 +380,7 @@ func (c *RouterOSRestClient) fetchList(listName string) ([]map[string]any, error
 		if !isNoSuchCommand(err) {
 			return nil, err
 		}
-		body, err = c.request(http.MethodGet, c.baseURL, nil)
+		body, err = c.request(http.MethodGet, menu, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -418,9 +438,13 @@ func (c *RouterOSRestClient) addAddress(listName, domain, address, timeout strin
 	}
 	id, err := c.createAddress(payload)
 	if err != nil {
-		// A concurrent writer may have won the race; adopt its entry.
+		// Another replica may have written the same address first; adopting
+		// its entry is the correct outcome, not an error.
 		if found, findErr := c.findAddressID(listName, address); findErr == nil && found != "" {
 			return found, nil
+		}
+		if isDuplicateEntryErr(err) {
+			return "", nil // it exists, we just could not learn its id
 		}
 		return "", err
 	}
@@ -444,7 +468,7 @@ func (c *RouterOSRestClient) ping(attempts int) error {
 	}
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		if _, err := c.requestOnce(http.MethodGet, c.baseURL, nil); err == nil {
+		if _, err := c.requestOnce(http.MethodGet, c.listURL(familyIPv4), nil); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -525,7 +549,7 @@ func (c *RouterOSRestClient) requestOnce(method, endpoint string, payload any) (
 // createAddress adds an entry and returns the id from the response body, so the
 // caller does not need a follow-up lookup to learn it.
 func (c *RouterOSRestClient) createAddress(payload map[string]string) (string, error) {
-	body, err := c.request(http.MethodPut, c.baseURL, payload)
+	body, err := c.request(http.MethodPut, c.addressURL(payload["address"]), payload)
 	if err != nil {
 		return "", err
 	}
@@ -573,8 +597,8 @@ func readRestID(entry map[string]any) string {
 	return ""
 }
 
-func (c *RouterOSRestClient) getAddressEntry(id string) (map[string]any, error) {
-	body, err := c.request(http.MethodGet, c.baseURL+"/"+id, nil)
+func (c *RouterOSRestClient) getAddressEntry(family, id string) (map[string]any, error) {
+	body, err := c.request(http.MethodGet, c.listURL(family)+"/"+id, nil)
 	if err != nil {
 		return nil, err
 	}

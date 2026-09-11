@@ -48,13 +48,8 @@ type Resolver struct {
 	httpTimeout       time.Duration
 	writeIPWithPrefix bool
 	dohHTTP           *http.Client
-	fallbackCache     map[string]cachedResponse
-	fallbackMu        sync.Mutex
-}
-
-type cachedResponse struct {
-	resp      *dns.Msg
-	expiresAt time.Time
+	dotPool           *upstreams.DoTPool
+	cache             *responseCache
 }
 
 type OutputTarget struct {
@@ -64,7 +59,7 @@ type OutputTarget struct {
 	Webhook *outputs.WebhookSender
 }
 
-func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, rules []config.DomainRule, ruleUpstreams map[int][]upstreams.Upstream, ruleRecords map[int]*records.Set, outputsList []OutputTarget, excludeSubnets []*net.IPNet, timeout, dnsTimeout, httpTimeout time.Duration, writeIPWithPrefix bool, dohHTTP *http.Client) *Resolver {
+func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, rules []config.DomainRule, ruleUpstreams map[int][]upstreams.Upstream, ruleRecords map[int]*records.Set, outputsList []OutputTarget, excludeSubnets []*net.IPNet, timeout, dnsTimeout, httpTimeout time.Duration, writeIPWithPrefix bool, dohHTTP *http.Client, cacheSize int, negativeTTL time.Duration) *Resolver {
 	if ruleUpstreams == nil {
 		ruleUpstreams = make(map[int][]upstreams.Upstream)
 	}
@@ -85,7 +80,8 @@ func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, 
 		httpTimeout:       httpTimeout,
 		writeIPWithPrefix: writeIPWithPrefix,
 		dohHTTP:           dohHTTP,
-		fallbackCache:     make(map[string]cachedResponse),
+		dotPool:           upstreams.NewDoTPool(),
+		cache:             newResponseCache(cacheSize, negativeTTL),
 	}
 }
 
@@ -179,6 +175,23 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		}
 	}
 
+	if cached, ok := r.cache.get(req); ok {
+		_ = w.WriteMsg(cached)
+		slog.Debug("dns reply", dnsReplyAttrs(DNSLog{
+			Qname:    qname,
+			Qtype:    qtype,
+			Upstream: cacheUpstreamLabel,
+			Rcode:    dns.RcodeToString[cached.Rcode],
+			Answers:  len(cached.Answer),
+		})...)
+		if match {
+			// Keep feeding outputs: the address lists have their own lifetime
+			// and may need the entry refreshed even while we answer from cache.
+			r.processMatchedResponses(rule, req.Question[0], singleResponseChannel(cached))
+		}
+		return
+	}
+
 	disableFallback := match && rule.DisableFallback
 	resp, firstUpstream, allCh, reason, err := r.resolveParallel(req, upstreamsList, disableFallback)
 	if err != nil {
@@ -193,6 +206,7 @@ func (r *Resolver) HandleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		}, err)...)
 		return
 	}
+	r.cache.put(req, resp)
 	_ = w.WriteMsg(resp)
 
 	if len(req.Question) == 0 {
@@ -266,8 +280,11 @@ func (r *Resolver) ResolveDomain(domain string, rule config.DomainRule, ruleInde
 	}
 }
 
-// staticUpstreamLabel marks replies served from preconfigured records.
-const staticUpstreamLabel = "static"
+// Labels marking where a reply came from when it did not come from an upstream.
+const (
+	staticUpstreamLabel = "static"
+	cacheUpstreamLabel  = "cache"
+)
 
 // staticResponse answers from preconfigured records when the rule covers the
 // queried name and type. Records apply to the rule's domain and, when the rule
@@ -485,8 +502,40 @@ func (r *Resolver) writeAddress(writer outputs.AddressWriter, listName, domain, 
 	}
 }
 
+type fallbackResult struct {
+	resp     *dns.Msg
+	upstream string
+	reason   string
+	err      error
+}
+
+// resolveParallel answers from the primary upstreams, using the fallback when
+// none of them returns an address.
+//
+// The fallback starts as soon as the first primary comes back without an
+// address, in parallel with the primaries still in flight, rather than after
+// all of them have finished. A name that genuinely does not resolve used to
+// cost the slowest primary plus a full fallback round trip in sequence; now the
+// two overlap. Primaries usually agree, so the extra fallback query is only
+// really sent when it was going to be needed anyway.
 func (r *Resolver) resolveParallel(req *dns.Msg, upstreamsList []upstreams.Upstream, disableFallback bool) (*dns.Msg, string, <-chan *dns.Msg, string, error) {
-	resp, upstream, allCh, reason, ok := r.resolvePrimary(req, upstreamsList, disableFallback)
+	useFallback := !disableFallback && len(r.fallbackUpstreams) > 0
+
+	var startOnce sync.Once
+	fbCh := make(chan fallbackResult, 1)
+	startFallback := func() {
+		if !useFallback {
+			return
+		}
+		startOnce.Do(func() {
+			go func() {
+				resp, upstream, reason, err := r.resolveFallback(req)
+				fbCh <- fallbackResult{resp: resp, upstream: upstream, reason: reason, err: err}
+			}()
+		})
+	}
+
+	resp, upstream, allCh, reason, ok := r.resolvePrimary(req, upstreamsList, disableFallback, startFallback)
 	if ok {
 		return resp, upstream, allCh, "", nil
 	}
@@ -496,23 +545,27 @@ func (r *Resolver) resolveParallel(req *dns.Msg, upstreamsList []upstreams.Upstr
 		}
 		return nil, "", allCh, reason, errors.New("all upstreams failed")
 	}
-	if len(r.fallbackUpstreams) == 0 {
+	if !useFallback {
 		return nil, "", allCh, reason, errors.New("all upstreams failed")
 	}
-	fbResp, fbUpstream, fbReason, err := r.resolveFallback(req)
-	if err != nil {
+
+	// Every primary is done and none had an address, so the fallback decides.
+	// It was started at the first negative answer and may already be waiting.
+	startFallback()
+	fb := <-fbCh
+	if fb.err != nil {
 		combined := reason
 		if combined == "" {
-			combined = fbReason
-		} else if fbReason != "" {
-			combined = combined + "; fallback: " + fbReason
+			combined = fb.reason
+		} else if fb.reason != "" {
+			combined = combined + "; fallback: " + fb.reason
 		}
-		return nil, "", allCh, combined, err
+		return nil, "", allCh, combined, fb.err
 	}
-	return fbResp, fbUpstream, allCh, "", nil
+	return fb.resp, fb.upstream, allCh, "", nil
 }
 
-func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstream, disableFallback bool) (*dns.Msg, string, <-chan *dns.Msg, string, bool) {
+func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstream, disableFallback bool, onNoAddress func()) (*dns.Msg, string, <-chan *dns.Msg, string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
 
 	type result struct {
@@ -550,7 +603,7 @@ func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstre
 			case "udp", "tcp":
 				resp, rtt, err = upstreams.ExchangeDNS(reqCtx, upstream.Kind, upstream.Address, req, dnsTimeout)
 			case "dot":
-				resp, rtt, err = upstreams.ExchangeDoT(reqCtx, upstream, req, dnsTimeout)
+				resp, rtt, err = upstreams.ExchangeDoT(reqCtx, r.dotPool, upstream, req, dnsTimeout)
 			case "doh":
 				resp, rtt, err = upstreams.ExchangeDoH(reqCtx, r.dohHTTP, upstream.URL, req)
 			default:
@@ -611,12 +664,17 @@ func (r *Resolver) resolvePrimary(req *dns.Msg, upstreamsList []upstreams.Upstre
 		for res := range resCh {
 			if res.err != nil {
 				errs = append(errs, res.err.Error())
+				onNoAddress()
 				continue
 			}
 			allCh <- res.resp
 			hasAddress := upstreams.ResponseHasAddress(res.resp, qtype)
 			if hasAddress {
 				normalSeen = true
+			} else {
+				// This upstream has nothing; get the fallback moving now
+				// instead of waiting for the rest to come back too.
+				onNoAddress()
 			}
 			if !firstSent && hasAddress {
 				firstSent = true
@@ -690,10 +748,6 @@ func (r *Resolver) resolveFallback(req *dns.Msg) (*dns.Msg, string, string, erro
 	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
 	defer cancel()
 
-	if cached, ok := r.fallbackCacheGet(req); ok {
-		return cached, "fallback:cache", "", nil
-	}
-
 	type result struct {
 		resp     *dns.Msg
 		err      error
@@ -724,7 +778,7 @@ func (r *Resolver) resolveFallback(req *dns.Msg) (*dns.Msg, string, string, erro
 			case "udp", "tcp":
 				resp, rtt, err = upstreams.ExchangeDNS(reqCtx, upstream.Kind, upstream.Address, req, r.dnsTimeout)
 			case "dot":
-				resp, rtt, err = upstreams.ExchangeDoT(reqCtx, upstream, req, r.dnsTimeout)
+				resp, rtt, err = upstreams.ExchangeDoT(reqCtx, r.dotPool, upstream, req, r.dnsTimeout)
 			case "doh":
 				resp, rtt, err = upstreams.ExchangeDoH(reqCtx, r.dohHTTP, upstream.URL, req)
 			default:
@@ -774,7 +828,6 @@ func (r *Resolver) resolveFallback(req *dns.Msg) (*dns.Msg, string, string, erro
 			errs = append(errs, res.err.Error())
 			continue
 		}
-		r.fallbackCacheSet(req, res.resp)
 		return res.resp, res.upstream, "", nil
 	}
 	reason := "all fallback upstreams failed"
@@ -782,23 +835,6 @@ func (r *Resolver) resolveFallback(req *dns.Msg) (*dns.Msg, string, string, erro
 		reason = strings.Join(errs, "; ")
 	}
 	return nil, "", reason, errors.New("all fallback upstreams failed")
-}
-
-func fallbackCacheKey(q dns.Question) string {
-	return strings.ToLower(q.Name) + "|" + dns.TypeToString[q.Qtype] + "|" + dns.ClassToString[q.Qclass]
-}
-
-func minAnswerTTL(resp *dns.Msg) uint32 {
-	if resp == nil || len(resp.Answer) == 0 {
-		return 0
-	}
-	minTTL := resp.Answer[0].Header().Ttl
-	for _, rr := range resp.Answer[1:] {
-		if ttl := rr.Header().Ttl; ttl < minTTL {
-			minTTL = ttl
-		}
-	}
-	return minTTL
 }
 
 func filterExcludedIPs(ips []string, subnets []*net.IPNet) []string {
@@ -860,58 +896,6 @@ func checkEDNS(req *dns.Msg, resp *dns.Msg, upstreamLabel string, qname string) 
 	if !respHasCookie || respCookie != reqCookie {
 		slog.Warn("upstream EDNS cookie mismatch", "qname", qname, "upstream", upstreamLabel)
 	}
-}
-
-func (r *Resolver) fallbackCacheGet(req *dns.Msg) (*dns.Msg, bool) {
-	if len(req.Question) == 0 {
-		return nil, false
-	}
-	key := fallbackCacheKey(req.Question[0])
-
-	r.fallbackMu.Lock()
-	entry, ok := r.fallbackCache[key]
-	if !ok {
-		r.fallbackMu.Unlock()
-		return nil, false
-	}
-	if time.Now().After(entry.expiresAt) {
-		delete(r.fallbackCache, key)
-		r.fallbackMu.Unlock()
-		return nil, false
-	}
-	remaining := entry.expiresAt.Sub(time.Now())
-	r.fallbackMu.Unlock()
-
-	resp := entry.resp.Copy()
-	resp.Id = req.Id
-	resp.Compress = req.Compress
-
-	remainingSec := uint32(remaining / time.Second)
-	for _, rr := range resp.Answer {
-		if rr.Header().Ttl > remainingSec {
-			rr.Header().Ttl = remainingSec
-		}
-	}
-	return resp, true
-}
-
-func (r *Resolver) fallbackCacheSet(req *dns.Msg, resp *dns.Msg) {
-	if len(req.Question) == 0 || resp == nil {
-		return
-	}
-	ttl := minAnswerTTL(resp)
-	if ttl == 0 {
-		return
-	}
-	key := fallbackCacheKey(req.Question[0])
-	expiry := time.Now().Add(time.Duration(ttl) * time.Second)
-
-	r.fallbackMu.Lock()
-	r.fallbackCache[key] = cachedResponse{
-		resp:      resp.Copy(),
-		expiresAt: expiry,
-	}
-	r.fallbackMu.Unlock()
 }
 
 // matchDomain picks the rule for a query name. A rule naming the domain exactly

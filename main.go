@@ -149,6 +149,15 @@ func main() {
 	if httpTimeout == 0 {
 		httpTimeout = timeout
 	}
+	// A nil cacheSize means "default"; an explicit 0 turns caching off.
+	cacheSize := 0
+	if cfg.Server.CacheSize != nil {
+		cacheSize = *cfg.Server.CacheSize
+		if cacheSize == 0 {
+			cacheSize = -1
+		}
+	}
+
 	excludeSubnets, err := parseExcludeSubnets(cfg.Server.ExcludeSubnets)
 	if err != nil {
 		slog.Error("parse exclude subnets", "error", err)
@@ -292,7 +301,7 @@ func main() {
 	// list instead of a lookup per address once the traffic starts.
 	warmupOutputLists(outputTargets, cfg.Domains)
 
-	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, ruleUpstreams, ruleRecords, outputTargets, excludeSubnets, timeout, dnsTimeout, httpTimeout, cfg.Server.WriteIPWithPrefix, dohHTTP)
+	res := resolver.New(upstreamsList, fallbackUpstreams, cfg.Domains, ruleUpstreams, ruleRecords, outputTargets, excludeSubnets, timeout, dnsTimeout, httpTimeout, cfg.Server.WriteIPWithPrefix, dohHTTP, cacheSize, cfg.Server.NegativeTTL)
 	if cfg.Server.ResolveAllOnStart && len(cfg.Domains) > 0 {
 		slog.Info("resolving all domains on start", "domains", len(cfg.Domains))
 		for i, rule := range cfg.Domains {

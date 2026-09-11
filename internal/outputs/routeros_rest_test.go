@@ -3,6 +3,7 @@ package outputs
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -75,12 +76,40 @@ func (f *fakeRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// familyOf reports which menu a request path addresses, mirroring the router's
+// split between /ip/firewall/address-list and /ipv6/firewall/address-list.
+func familyOf(path string) string {
+	if strings.Contains(path, "/ipv6/") {
+		return "ipv6"
+	}
+	return "ip"
+}
+
+// entryFamily is where an entry belongs: IPv6 literals in the v6 menu,
+// everything else (IPv4, CIDRs, DNS names) in the v4 one.
+func entryFamily(address string) string {
+	ip := net.ParseIP(address)
+	if ip == nil {
+		if _, ipNet, err := net.ParseCIDR(address); err == nil {
+			ip = ipNet.IP
+		}
+	}
+	if ip != nil && ip.To4() == nil {
+		return "ipv6"
+	}
+	return "ip"
+}
+
 func (f *fakeRouter) handleGet(w http.ResponseWriter, r *http.Request) {
 	list := r.URL.Query().Get("list")
+	family := familyOf(r.URL.Path)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]map[string]any, 0, len(f.entries))
 	for _, entry := range f.entries {
+		if entryFamily(fmt.Sprint(entry["address"])) != family {
+			continue
+		}
 		if list == "" || entry["list"] == list {
 			out = append(out, entry)
 		}
@@ -94,7 +123,29 @@ func (f *fakeRouter) handlePut(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	address := fmt.Sprint(payload["address"])
+	// The real router rejects an IPv6 literal in the IPv4 menu this way.
+	if familyOf(r.URL.Path) != entryFamily(address) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": 400, "message": "Bad Request",
+			"detail": fmt.Sprintf("failure: %s is not a valid dns name", address),
+		})
+		return
+	}
+
 	f.mu.Lock()
+	for _, existing := range f.entries {
+		if existing["list"] == payload["list"] && existing["address"] == payload["address"] {
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": 400, "message": "Bad Request",
+				"detail": "failure: already have such entry",
+			})
+			return
+		}
+	}
 	id := fmt.Sprintf("*%d", f.nextID)
 	f.nextID++
 	entry := map[string]any{".id": id}
@@ -168,8 +219,8 @@ func TestRestWarmupAvoidsPerAddressLookups(t *testing.T) {
 
 	client.WarmupLists([]string{"blocked"})
 	gets, _, _ = router.counts()
-	if gets != 2 {
-		t.Fatalf("expected warmup to cost one request, got %d GETs total", gets)
+	if gets != 3 {
+		t.Fatalf("expected warmup to read both menus, got %d GETs total", gets)
 	}
 
 	for _, address := range []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"} {
@@ -179,7 +230,7 @@ func TestRestWarmupAvoidsPerAddressLookups(t *testing.T) {
 	}
 
 	gets, puts, patches := router.counts()
-	if gets != 2 || puts != 0 || patches != 0 {
+	if gets != 3 || puts != 0 || patches != 0 {
 		t.Errorf("known addresses should be free: got %d GETs, %d PUTs, %d PATCHes", gets, puts, patches)
 	}
 }
@@ -436,10 +487,101 @@ func TestRestWarmupIsIdempotent(t *testing.T) {
 
 	client.WarmupLists([]string{"blocked", " blocked ", "", "blocked"})
 	gets, _, _ := router.counts()
-	if gets != 2 {
-		t.Errorf("expected the duplicate list names to collapse into one request, got %d GETs", gets)
+	if gets != 3 {
+		t.Errorf("expected the duplicate list names to collapse into one snapshot, got %d GETs", gets)
 	}
-	if !strings.HasSuffix(client.baseURL, "/rest/ip/firewall/address-list") {
+	if !strings.HasSuffix(client.baseURL, "/rest") {
 		t.Errorf("unexpected base url %q", client.baseURL)
+	}
+}
+
+// IPv6 belongs in /ipv6/firewall/address-list; the IPv4 menu rejects it as
+// "not a valid dns name".
+func TestRestWritesIPv6ToItsOwnMenu(t *testing.T) {
+	router := newFakeRouter()
+	client := newTestRestClient(t, router, nil)
+	client.WarmupLists([]string{"blocked"})
+
+	addresses := []string{"1.2.3.4", "2606:4700:4700::1111", "10.0.0.0/8", "2606:4700::/32"}
+	for _, address := range addresses {
+		if err := client.EnsureAddress("blocked", "example.com", address, nil, nil); err != nil {
+			t.Fatalf("ensure %s: %v", address, err)
+		}
+	}
+
+	if got := router.size(); got != len(addresses) {
+		t.Fatalf("expected all %d addresses written, got %d", len(addresses), got)
+	}
+	// A repeat is free, which means each entry was found where it was put.
+	_, putsBefore, _ := router.counts()
+	for _, address := range addresses {
+		if err := client.EnsureAddress("blocked", "example.com", address, nil, nil); err != nil {
+			t.Fatalf("re-ensure %s: %v", address, err)
+		}
+	}
+	if _, puts, _ := router.counts(); puts != putsBefore {
+		t.Errorf("expected repeats to be served from cache, got %d extra writes", puts-putsBefore)
+	}
+}
+
+// A snapshot has to read both menus, or IPv6 entries look missing and get
+// rewritten (or restored) forever.
+func TestRestSnapshotReadsBothMenus(t *testing.T) {
+	router := newFakeRouter(
+		routerEntry("*1", "blocked", "1.2.3.4", "v4.example.com", ""),
+		routerEntry("*2", "blocked", "2606:4700:4700::1111", "v6.example.com", ""),
+	)
+	client := newTestRestClient(t, router, nil)
+	client.WarmupLists([]string{"blocked"})
+
+	_, putsBefore, _ := router.counts()
+	for _, address := range []string{"1.2.3.4", "2606:4700:4700::1111"} {
+		if err := client.EnsureAddress("blocked", "example.com", address, nil, nil); err != nil {
+			t.Fatalf("ensure %s: %v", address, err)
+		}
+	}
+	if _, puts, _ := router.counts(); puts != putsBefore {
+		t.Errorf("both menus should have been cached by the snapshot, got %d writes", puts-putsBefore)
+	}
+}
+
+// Several replicas race on the same address; losing the race is success.
+func TestRestAdoptsEntryWrittenByAnotherReplica(t *testing.T) {
+	router := newFakeRouter()
+	first := newTestRestClient(t, router, nil)
+	second := newTestRestClient(t, router, nil)
+	for _, client := range []*RouterOSRestClient{first, second} {
+		client.WarmupLists([]string{"blocked"})
+	}
+
+	if err := first.EnsureAddress("blocked", "example.com", "1.2.3.4", nil, nil); err != nil {
+		t.Fatalf("first replica: %v", err)
+	}
+	// The second replica still believes the list is empty and writes too.
+	if err := second.EnsureAddress("blocked", "example.com", "1.2.3.4", nil, nil); err != nil {
+		t.Errorf("a duplicate write must not surface as an error: %v", err)
+	}
+	if got := router.size(); got != 1 {
+		t.Errorf("expected a single entry on the router, got %d", got)
+	}
+}
+
+func TestRestAdoptsDuplicateIPv6(t *testing.T) {
+	router := newFakeRouter()
+	first := newTestRestClient(t, router, nil)
+	second := newTestRestClient(t, router, nil)
+	for _, client := range []*RouterOSRestClient{first, second} {
+		client.WarmupLists([]string{"blocked"})
+	}
+
+	const address = "2606:4700:4700::1111"
+	if err := first.EnsureAddress("blocked", "example.com", address, nil, nil); err != nil {
+		t.Fatalf("first replica: %v", err)
+	}
+	if err := second.EnsureAddress("blocked", "example.com", address, nil, nil); err != nil {
+		t.Errorf("a duplicate IPv6 write must not surface as an error: %v", err)
+	}
+	if got := router.size(); got != 1 {
+		t.Errorf("expected a single entry on the router, got %d", got)
 	}
 }
