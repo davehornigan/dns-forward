@@ -108,7 +108,7 @@ func main() {
 	ruleRecords := make(map[int]*records.Set)
 	recordSummaries := make([]string, 0, len(cfg.Domains))
 	for i, rule := range cfg.Domains {
-		set, err := records.Compile(rule.Domain, rule.Records.ToMap(), rule.RecordsTTL)
+		set, err := records.Compile(rule.Domain, rule.Records.ToMap(), rule.RecordsTTL, rule.MatchingType.MatchesExactly())
 		if err != nil {
 			slog.Error("parse domain records", "domain", rule.Domain, "error", err)
 			os.Exit(1)

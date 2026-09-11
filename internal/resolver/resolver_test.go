@@ -233,7 +233,7 @@ func TestMatchDomainWithoutRulesMatchesEverything(t *testing.T) {
 
 func newResolverWithRecords(t *testing.T, rule config.DomainRule, raw map[string][]string) (*Resolver, *records.Set) {
 	t.Helper()
-	set, err := records.Compile(rule.Domain, raw, 0)
+	set, err := records.Compile(rule.Domain, raw, 0, true)
 	if err != nil {
 		t.Fatalf("compile records: %v", err)
 	}

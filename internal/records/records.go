@@ -23,7 +23,11 @@ type Set struct {
 
 // Compile builds a Set from raw config values keyed by record type name.
 // Returns (nil, nil) when no records are configured.
-func Compile(domain string, raw map[string][]string, ttl time.Duration) (*Set, error) {
+//
+// answersDomain says whether the rule owning these records replies for the
+// domain itself rather than only for its subdomains. It decides whether a CNAME
+// back to the domain is a loop or a legitimate alias.
+func Compile(domain string, raw map[string][]string, ttl time.Duration, answersDomain bool) (*Set, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
@@ -72,10 +76,13 @@ func Compile(domain string, raw map[string][]string, ttl time.Duration) (*Set, e
 		if len(set.byType) > 1 {
 			return nil, errors.New("CNAME cannot be combined with other record types")
 		}
-		// A CNAME to its own name is a loop: following it leads straight back
-		// to the same question.
-		if cname, ok := cnames[0].(*dns.CNAME); ok && strings.EqualFold(cname.Target, fqdn) {
-			return nil, fmt.Errorf("CNAME points at its own domain %q", domain)
+		// A CNAME back to the domain is a loop only when the rule answers for
+		// that domain. A rule serving just the subdomains may legitimately
+		// alias all of them to the apex.
+		if answersDomain {
+			if cname, ok := cnames[0].(*dns.CNAME); ok && strings.EqualFold(cname.Target, fqdn) {
+				return nil, fmt.Errorf("CNAME points at its own domain %q", domain)
+			}
 		}
 	}
 	for qtype := range set.byType {

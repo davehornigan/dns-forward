@@ -13,7 +13,7 @@ func TestCompileAnswers(t *testing.T) {
 		"aaaa": {"fe80::1"},
 		"TXT":  {"hello world"},
 		"MX":   {"10 mail.example.com"},
-	}, 0)
+	}, 0, true)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestCompileAnswers(t *testing.T) {
 }
 
 func TestAnswerRewritesSubdomainName(t *testing.T) {
-	set, err := Compile("example.com", map[string][]string{"A": {"1.2.3.4"}}, 0)
+	set, err := Compile("example.com", map[string][]string{"A": {"1.2.3.4"}}, 0, true)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestAnswerRewritesSubdomainName(t *testing.T) {
 }
 
 func TestAnswerDoesNotMutateStoredRecords(t *testing.T) {
-	set, err := Compile("example.com", map[string][]string{"A": {"1.2.3.4"}}, time.Minute)
+	set, err := Compile("example.com", map[string][]string{"A": {"1.2.3.4"}}, time.Minute, true)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestAnswerDoesNotMutateStoredRecords(t *testing.T) {
 }
 
 func TestCompileCNAME(t *testing.T) {
-	set, err := Compile("alias.example.com", map[string][]string{"CNAME": {"google.com"}}, 0)
+	set, err := Compile("alias.example.com", map[string][]string{"CNAME": {"google.com"}}, 0, true)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestCompileErrors(t *testing.T) {
 	}
 	for name, raw := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := Compile("example.com", raw, 0); err == nil {
+			if _, err := Compile("example.com", raw, 0, true); err == nil {
 				t.Error("expected an error")
 			}
 		})
@@ -109,7 +109,7 @@ func TestCompileErrors(t *testing.T) {
 }
 
 func TestCompileEmpty(t *testing.T) {
-	set, err := Compile("example.com", nil, 0)
+	set, err := Compile("example.com", nil, 0, true)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -120,13 +120,29 @@ func TestCompileEmpty(t *testing.T) {
 
 func TestCompileRejectsSelfCNAME(t *testing.T) {
 	for _, target := range []string{"example.com", "example.com.", "EXAMPLE.COM"} {
-		_, err := Compile("example.com", map[string][]string{"CNAME": {target}}, 0)
+		_, err := Compile("example.com", map[string][]string{"CNAME": {target}}, 0, true)
 		if err == nil {
 			t.Errorf("expected a self-referencing CNAME %q to be rejected", target)
 		}
 	}
 	// A different name is still fine.
-	if _, err := Compile("example.com", map[string][]string{"CNAME": {"other.example.com"}}, 0); err != nil {
+	if _, err := Compile("example.com", map[string][]string{"CNAME": {"other.example.com"}}, 0, true); err != nil {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// A rule that serves only subdomains never answers for the domain itself, so
+// aliasing every subdomain to the apex is legitimate, not a loop.
+func TestCompileAllowsCNAMEToApexForSubdomainRules(t *testing.T) {
+	set, err := Compile("example.com", map[string][]string{"CNAME": {"example.com"}}, 0, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cname := set.CNAME("www.example.com.")
+	if cname == nil || cname.Target != "example.com." {
+		t.Errorf("unexpected record %v", cname)
+	}
+	if cname.Hdr.Name != "www.example.com." {
+		t.Errorf("expected the answer to carry the queried name, got %q", cname.Hdr.Name)
 	}
 }
