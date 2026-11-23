@@ -18,6 +18,10 @@ import (
 	"log/slog"
 )
 
+// version is the release tag, set at build time with
+// -ldflags "-X main.version=...". It stays "dev" for a local build.
+var version = "dev"
+
 const (
 	defaultListenAddr = ":53"
 	defaultTimeout    = 5 * time.Second
@@ -290,6 +294,7 @@ func main() {
 	}
 
 	slog.Info("config",
+		"version", version,
 		"sources", cfg.Sources,
 		"upstreams", upstreams.Labels(upstreamsList),
 		"fallback_upstreams", fallbackLabels,

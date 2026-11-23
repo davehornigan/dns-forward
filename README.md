@@ -270,5 +270,14 @@ Run the published image from GHCR:
 docker run --rm -p 55353:55353/udp -p 55353:55353/tcp ghcr.io/davehornigan/dns-forward:latest
 ```
 
+The image is built from `gcr.io/distroless/static-debian12`: the binary, CA
+certificates and nothing else — no shell and no package manager. It carries the
+release tag, logged under `version` on the `config` line at startup. Mount your
+config over `/app/config.yaml`, which is where the default `CMD` looks for it.
+
+It runs as root so the default `listenAddr: ":53"` can be bound. On a high port
+you can drop the privileges yourself with `--user 65532:65532`; to keep port 53
+as an unprivileged user, add `--cap-add=NET_BIND_SERVICE` instead.
+
 ## License
 Noncommercial. See `LICENSE`.
