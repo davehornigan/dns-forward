@@ -39,6 +39,7 @@ type Resolver struct {
 	fallbackUpstreams []upstreams.Upstream
 	rules             []config.DomainRule
 	exactRules        map[string]int
+	subdomainRules    map[string][]int
 	ruleUpstreams     map[int][]upstreams.Upstream
 	ruleRecords       map[int]*records.Set
 	outputs           []OutputTarget
@@ -71,6 +72,7 @@ func New(upstreamsList []upstreams.Upstream, fallbackList []upstreams.Upstream, 
 		fallbackUpstreams: fallbackList,
 		rules:             rules,
 		exactRules:        indexExactRules(rules),
+		subdomainRules:    indexSubdomainRules(rules),
 		ruleUpstreams:     ruleUpstreams,
 		ruleRecords:       ruleRecords,
 		outputs:           outputsList,
@@ -908,17 +910,72 @@ func (r *Resolver) matchDomain(qname string) (bool, config.DomainRule, int) {
 	name := strings.TrimSuffix(strings.ToLower(qname), ".")
 
 	// Exact names are indexed, so the common case is a single map lookup and no
-	// scan at all. Only a name without an exact rule walks the list, and that
-	// walk stops at the first subdomain rule covering it.
+	// scan at all. Only a name without an exact rule looks at subdomain rules,
+	// and those are indexed by the domain they are anchored at.
 	if i, ok := r.exactRules[name]; ok {
 		return true, r.rules[i], i
 	}
-	for i, rule := range r.rules {
-		if ruleCoversSubdomain(rule, name) {
-			return true, rule, i
-		}
+	if i := r.matchSubdomainRule(name); i >= 0 {
+		return true, r.rules[i], i
 	}
 	return false, config.DomainRule{}, -1
+}
+
+// matchSubdomainRule returns the config index of the first rule covering name as
+// a subdomain, or -1. It walks the name's parent domains rather than the rule
+// list, so the work depends on how many labels the name has, not on how many
+// rules exist. Within a parent the indices are in config order, so the walk
+// stops as soon as it can no longer beat the best index found so far — a regex
+// rule therefore runs its regex only for names actually sitting under its own
+// domain, and at most once.
+func (r *Resolver) matchSubdomainRule(name string) int {
+	if len(r.subdomainRules) == 0 {
+		return -1
+	}
+	best := -1
+	for parent := name; ; {
+		dot := strings.IndexByte(parent, '.')
+		if dot < 0 {
+			break
+		}
+		parent = parent[dot+1:]
+		candidates, ok := r.subdomainRules[parent]
+		if !ok {
+			continue
+		}
+		prefix := name[:len(name)-len(parent)-1]
+		for _, i := range candidates {
+			if best >= 0 && i > best {
+				break
+			}
+			if coversSubdomainPrefix(&r.rules[i], prefix) {
+				best = i
+				break
+			}
+		}
+	}
+	return best
+}
+
+// indexSubdomainRules groups the rules that match subdomains by the domain they
+// are anchored at, keeping config order inside each group, so a query only ever
+// looks at rules whose domain is one of its own parents.
+func indexSubdomainRules(rules []config.DomainRule) map[string][]int {
+	var index map[string][]int
+	for i, rule := range rules {
+		if !rule.MatchingType.MatchesSubdomains() {
+			continue
+		}
+		domain := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(rule.Domain)), ".")
+		if domain == "" {
+			continue
+		}
+		if index == nil {
+			index = make(map[string][]int)
+		}
+		index[domain] = append(index[domain], i)
+	}
+	return index
 }
 
 // indexExactRules maps each domain to the first rule that applies to the domain
@@ -955,14 +1012,21 @@ func ruleCoversSubdomain(rule config.DomainRule, name string) bool {
 	if rule.Domain == "" || !rule.MatchingType.MatchesSubdomains() {
 		return false
 	}
-	if !strings.HasSuffix(name, "."+rule.Domain) {
+	cut := len(name) - len(rule.Domain) - 1
+	if cut <= 0 || name[cut] != '.' || name[cut+1:] != rule.Domain {
 		return false
 	}
-	if rule.MaxDepth == nil {
-		return true
+	return coversSubdomainPrefix(&rule, name[:cut])
+}
+
+// coversSubdomainPrefix applies a rule's own limits to a name already known to
+// sit under its domain. prefix is the part of the name before ".<domain>", so
+// its label count is the subdomain depth.
+func coversSubdomainPrefix(rule *config.DomainRule, prefix string) bool {
+	if rule.MaxDepth != nil && strings.Count(prefix, ".")+1 > *rule.MaxDepth {
+		return false
 	}
-	depth := strings.Count(name, ".") - strings.Count(rule.Domain, ".")
-	return depth <= *rule.MaxDepth
+	return rule.MatchesSubdomainPrefix(prefix)
 }
 
 func normalizeOutputs(outputsList []string) []string {

@@ -297,6 +297,7 @@ func TestMatchingTypePredicates(t *testing.T) {
 		{MatchExact, true, false},
 		{MatchWithSubdomains, true, true},
 		{MatchSubdomainsOnly, false, true},
+		{MatchSubdomainRegex, false, true},
 	}
 	for _, tt := range tests {
 		if got := tt.value.MatchesExactly(); got != tt.exact {
@@ -401,5 +402,84 @@ domains:
 	}
 	if len(records["A"]) != 2 {
 		t.Errorf("expected both A values, got %v", records["A"])
+	}
+}
+
+func TestLoadSubdomainRegex(t *testing.T) {
+	load := func(t *testing.T, rule string) (*Config, error) {
+		t.Helper()
+		dir := t.TempDir()
+		main := writeFile(t, dir, "config.yaml", `
+upstreams: [udp://1.1.1.1:53]
+outputs:
+  - {type: file, id: f, path: ./data, listName: l}
+domains:
+  - domain: akamaized.net
+`+rule+`
+`)
+		return Load(main)
+	}
+
+	t.Run("compiles the regex", func(t *testing.T) {
+		cfg, err := load(t, "    matchingType: subdomainRegex\n    regex: '-rockstargames-com$'")
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		rule := cfg.Domains[0]
+		if rule.MatchingType != MatchSubdomainRegex {
+			t.Fatalf("matchingType = %q", rule.MatchingType)
+		}
+		if !rule.MatchesSubdomainPrefix("e1-rockstargames-com") {
+			t.Error("expected the prefix to match")
+		}
+		if rule.MatchesSubdomainPrefix("e1-rockstargames-com.cdn") {
+			t.Error("$ should anchor the match at the end of the prefix")
+		}
+	})
+
+	t.Run("regex alone implies subdomainRegex", func(t *testing.T) {
+		cfg, err := load(t, "    regex: '-rockstargames-com$'")
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if got := cfg.Domains[0].MatchingType; got != MatchSubdomainRegex {
+			t.Errorf("matchingType = %q, want %q", got, MatchSubdomainRegex)
+		}
+	})
+
+	t.Run("rejects the type without a regex", func(t *testing.T) {
+		_, err := load(t, "    matchingType: subdomainRegex")
+		if err == nil || !strings.Contains(err.Error(), "requires a regex") {
+			t.Errorf("expected a missing-regex error, got %v", err)
+		}
+	})
+
+	t.Run("rejects a regex on another type", func(t *testing.T) {
+		_, err := load(t, "    matchingType: withSubdomains\n    regex: 'x'")
+		if err == nil || !strings.Contains(err.Error(), "subdomainRegex") {
+			t.Errorf("expected a mismatched-type error, got %v", err)
+		}
+	})
+
+	t.Run("rejects an invalid regex", func(t *testing.T) {
+		_, err := load(t, "    regex: '*broken'")
+		if err == nil || !strings.Contains(err.Error(), "invalid regex") {
+			t.Errorf("expected a compile error, got %v", err)
+		}
+	})
+}
+
+// A rule built in code matches nothing until its regex is compiled, so a
+// forgotten CompileRegex cannot silently widen the rule to every subdomain.
+func TestUncompiledRegexMatchesNothing(t *testing.T) {
+	rule := DomainRule{Domain: "akamaized.net", MatchingType: MatchSubdomainRegex, Regex: "-rockstargames-com$"}
+	if rule.MatchesSubdomainPrefix("e1-rockstargames-com") {
+		t.Fatal("an uncompiled regex must not match")
+	}
+	if err := rule.CompileRegex(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !rule.MatchesSubdomainPrefix("e1-rockstargames-com") {
+		t.Error("expected the compiled regex to match")
 	}
 }

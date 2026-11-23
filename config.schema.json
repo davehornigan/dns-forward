@@ -49,7 +49,8 @@
       "additionalProperties": false,
       "properties": {
         "domain": { "type": "string" },
-        "matchingType": { "type": ["string", "null"], "enum": ["exact", "withSubdomains", "subdomainsOnly", null] },
+        "matchingType": { "type": ["string", "null"], "enum": ["exact", "withSubdomains", "subdomainsOnly", "subdomainRegex", null] },
+        "regex": { "type": ["string", "null"], "format": "regex", "$comment": "subdomainRegex only: matched against the part of the name before the domain" },
         "maxDepth": { "type": ["integer", "null"], "minimum": 0 },
         "listName": { "type": ["string", "null"] },
         "outputs": { "type": ["array", "null"], "items": { "type": "string" } },
@@ -74,7 +75,18 @@
         "recordsOnly": { "type": ["boolean", "null"] }
       },
       "required": ["domain"],
-      "not": { "required": ["upstreamsOverride", "upstreamsBlacklist"] }
+      "allOf": [
+        { "not": { "required": ["upstreamsOverride", "upstreamsBlacklist"] } },
+        {
+          "$comment": "regex and matchingType: subdomainRegex require each other",
+          "if": { "properties": { "matchingType": { "const": "subdomainRegex" } }, "required": ["matchingType"] },
+          "then": { "required": ["regex"] },
+          "else": {
+            "if": { "required": ["regex"], "properties": { "regex": { "type": "string" } } },
+            "then": { "properties": { "matchingType": { "type": "null" } } }
+          }
+        }
+      ]
     },
     "output": {
       "oneOf": [

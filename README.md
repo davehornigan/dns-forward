@@ -86,6 +86,11 @@ domains:
     upstreamsOverride:
       - tls://one.one.one.one
       - https://one.one.one.one/dns-query
+  - domain: akamaized.net
+    matchingType: subdomainRegex
+    regex: '-rockstargames-com$'
+    maxDepth: 1
+    listName: no-vpn
   - domain: example.com
     matchingType: exact
     upstreamsBlacklist:
@@ -152,7 +157,7 @@ Server:
 - `server.dnsTimeout` applies to upstream DNS queries.
 - `server.httpTimeout` applies to webhook and RouterOS API requests.
 - `server.writeIPWithPrefix` writes resolved IPs as `/32` (IPv4) or `/128` (IPv6).
-- `server.resolveAllDomainsOnStart` resolves each configured domain at startup (A and AAAA) and emits results to outputs.
+- `server.resolveAllDomainsOnStart` resolves each configured domain at startup (A and AAAA) and emits results to outputs. Rules that only cover subdomains (`subdomainsOnly`, `subdomainRegex`) are skipped, since they do not answer for the domain they are named after.
 - `server.excludeSubnets` drops resolved IPs within these CIDRs before writing to outputs.
 - `server.cacheSize` bounds the response cache in entries (default `10000`, `0` disables it). Answers are reused until their TTL runs out, and the TTL handed to the client counts down so nobody caches longer than the origin allowed. Failures are never cached.
 - `server.negativeTTL` caps how long NXDOMAIN and empty answers are kept (default `30s`). A shorter SOA lifetime in the response wins over this cap.
@@ -172,10 +177,19 @@ Domains:
 - `domains[].matchingType` says which names the rule applies to:
   - `exact` (default) — the domain itself only;
   - `withSubdomains` — the domain and its subdomains;
-  - `subdomainsOnly` — the subdomains but not the domain itself.
+  - `subdomainsOnly` — the subdomains but not the domain itself;
+  - `subdomainRegex` — the subdomains whose name matches `domains[].regex`; the domain itself is never matched.
 
   Values are case-insensitive and `-`/`_` are ignored, so `with_subdomains` also works. `maxDepth` bounds how deep a subdomain may be, counted from the domain.
-- A rule that applies to the queried domain itself (`exact` or `withSubdomains`) always wins over one that only reaches it as a subdomain, whatever order they appear in. Among rules of the same kind the first one in the config wins, so put narrower subdomain rules above broader ones. A name that falls outside one rule's `maxDepth` can still be picked up by a broader rule further down.
+- `domains[].regex` is a [Go regular expression](https://pkg.go.dev/regexp/syntax) tested against the part of the name that sits *before* the domain, so for `domain: akamaized.net` the name `e1-rockstargames-com.akamaized.net` is matched as `e1-rockstargames-com`. The match is unanchored — it succeeds anywhere in that part — so anchor it with `^`/`$` when you need the whole prefix. The two fields require each other: `regex` only means anything under `subdomainRegex`, and a rule carrying `regex` without a `matchingType` is read as `subdomainRegex`. An invalid regex is rejected at startup.
+
+  ```yaml
+  - domain: akamaized.net
+    regex: '-rockstargames-com$'
+    maxDepth: 1
+    listName: no-vpn
+  ```
+- A rule that applies to the queried domain itself (`exact` or `withSubdomains`) always wins over one that only reaches it as a subdomain, whatever order they appear in. Among rules of the same kind the first one in the config wins, so put narrower subdomain rules above broader ones. A name that falls outside one rule's `maxDepth` or `regex` can still be picked up by a broader rule further down.
 - `domains[].listName` overrides the output list name for all outputs; otherwise each output uses its own `listName`.
 - `domains[].outputs` controls which outputs are used by ID. If omitted or null, all outputs are used. If empty, nothing is written.
 - `domains[].upstreamsOverride` overrides the primary upstream list for matching domains; if omitted, global `upstreams` are used. Fallback upstreams are always shared.
@@ -187,7 +201,7 @@ Preconfigured records:
 - Values use zone-file syntax, with shortcuts: targets may be written without a trailing dot (`CNAME: google.com`) and `TXT` values are quoted automatically. A single value can be written as a scalar instead of a list.
 - Records follow the rule's own `matchingType`, so they answer for every name the rule covers, honouring `maxDepth`. Names the rule does not cover go upstream.
 - Every type but `CNAME` may repeat on a name: several `TXT` records (SPF, DKIM, verification tokens) or several `A` records are normal. A name holds exactly one `CNAME` and it cannot be combined with other types — the DNS standard requires it, since a name has exactly one canonical name. For that reason `CNAME` must be written as a single value, not a list.
-- A `CNAME` pointing at the name it answers for is a loop and is rejected at startup — but only when the rule actually answers for that name. Under `subdomainsOnly` a `CNAME` back to the domain is a legitimate alias, since the rule serves the subdomains and never the domain itself.
+- A `CNAME` pointing at the name it answers for is a loop and is rejected at startup — but only when the rule actually answers for that name. Under `subdomainsOnly` or `subdomainRegex` a `CNAME` back to the domain is a legitimate alias, since the rule serves the subdomains and never the domain itself.
 - A target can also collide with a subdomain at query time, which no startup check can see: `CNAME: www.example.com` on a rule covering `example.com` and its subdomains becomes `www.example.com -> www.example.com` for that one name. That answer is dropped with a warning and the query is forwarded (or answered as NODATA under `recordsOnly`).
 - When an `A`/`AAAA` query hits a `CNAME`-only rule, the target is resolved upstream and the full chain is returned; the target's addresses are written to outputs under the queried name.
 - `domains[].recordsTTL` sets the TTL of preconfigured records (default `5m`).

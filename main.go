@@ -305,7 +305,10 @@ func main() {
 	if cfg.Server.ResolveAllOnStart && len(cfg.Domains) > 0 {
 		slog.Info("resolving all domains on start", "domains", len(cfg.Domains))
 		for i, rule := range cfg.Domains {
-			if rule.Domain == "" {
+			// A rule that only covers subdomains does not answer for the domain
+			// it is named after, so resolving it here would write addresses the
+			// rule never matches.
+			if rule.Domain == "" || !rule.MatchingType.MatchesExactly() {
 				continue
 			}
 			res.ResolveDomain(rule.Domain, rule, i)

@@ -38,6 +38,11 @@ domains:
     upstreamsOverride:
       - tls://one.one.one.one
       - https://one.one.one.one/dns-query
+  - domain: akamaized.net
+    matchingType: subdomainRegex
+    regex: '-rockstargames-com$'
+    maxDepth: 1
+    listName: no-vpn
   - domain: example.com
     matchingType: exact
     disableFallback: false

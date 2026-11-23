@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -54,9 +55,12 @@ const (
 	MatchWithSubdomains MatchingType = "withSubdomains"
 	// MatchSubdomainsOnly matches the subdomains but not the domain itself.
 	MatchSubdomainsOnly MatchingType = "subdomainsOnly"
+	// MatchSubdomainRegex matches the subdomains whose label prefix matches the
+	// rule's regex. The domain itself is never touched.
+	MatchSubdomainRegex MatchingType = "subdomainRegex"
 )
 
-var matchingTypes = []MatchingType{MatchExact, MatchWithSubdomains, MatchSubdomainsOnly}
+var matchingTypes = []MatchingType{MatchExact, MatchWithSubdomains, MatchSubdomainsOnly, MatchSubdomainRegex}
 
 // ParseMatchingType accepts the value in any case, with or without separators,
 // so "withSubdomains", "with_subdomains" and "WITH-SUBDOMAINS" all work.
@@ -97,7 +101,7 @@ func (t MatchingType) MatchesExactly() bool {
 
 // MatchesSubdomains reports whether the rule applies to subdomains.
 func (t MatchingType) MatchesSubdomains() bool {
-	return t == MatchWithSubdomains || t == MatchSubdomainsOnly
+	return t == MatchWithSubdomains || t == MatchSubdomainsOnly || t == MatchSubdomainRegex
 }
 
 type DomainRule struct {
@@ -112,6 +116,56 @@ type DomainRule struct {
 	Records            RecordSet     `yaml:"records"`
 	RecordsTTL         time.Duration `yaml:"recordsTTL"`
 	RecordsOnly        bool          `yaml:"recordsOnly"`
+
+	// Regex narrows matchingType: subdomainRegex to the subdomains whose part
+	// before the domain matches it. It is compiled once at load time.
+	Regex string `yaml:"regex"`
+
+	subdomainRe *regexp.Regexp
+}
+
+// CompileRegex validates Regex and caches the compiled form. Loading the config
+// calls it for every rule, so a regex that does not compile stops the process
+// at startup rather than silently never matching. A rule built in code must
+// call it itself: an uncompiled Regex matches nothing rather than everything.
+func (r *DomainRule) CompileRegex() error {
+	r.Regex = strings.TrimSpace(r.Regex)
+	r.subdomainRe = nil
+	if err := r.compileRegex(); err != nil {
+		if domain := strings.TrimSpace(r.Domain); domain != "" {
+			return fmt.Errorf("domain %s: %w", domain, err)
+		}
+		return err
+	}
+	return nil
+}
+
+func (r *DomainRule) compileRegex() error {
+	if r.MatchingType == MatchSubdomainRegex && r.Regex == "" {
+		return fmt.Errorf("matchingType %s requires a regex", MatchSubdomainRegex)
+	}
+	if r.Regex == "" {
+		return nil
+	}
+	if r.MatchingType != MatchSubdomainRegex {
+		return fmt.Errorf("regex applies to matchingType %s only, not %s", MatchSubdomainRegex, r.MatchingType)
+	}
+	compiled, err := regexp.Compile(r.Regex)
+	if err != nil {
+		return fmt.Errorf("invalid regex %q: %w", r.Regex, err)
+	}
+	r.subdomainRe = compiled
+	return nil
+}
+
+// MatchesSubdomainPrefix reports whether the rule accepts a subdomain, given
+// the part of the name that sits before ".<domain>". Rules without a regex take
+// every prefix, so the check costs one nil comparison on the hot path.
+func (r *DomainRule) MatchesSubdomainPrefix(prefix string) bool {
+	if r.subdomainRe != nil {
+		return r.subdomainRe.MatchString(prefix)
+	}
+	return r.Regex == ""
 }
 
 // removedDomainFields map retired keys to the migration hint shown for them.
@@ -133,13 +187,19 @@ func (r *DomainRule) UnmarshalYAML(node *yaml.Node) error {
 	if err := node.Decode(&rule); err != nil {
 		return err
 	}
-	matching, err := ParseMatchingType(string(rule.MatchingType))
-	if err != nil {
-		return err
+	// A bare `regex` says enough on its own: it only means anything under
+	// subdomainRegex, so the matchingType may be left out.
+	if strings.TrimSpace(string(rule.MatchingType)) == "" && strings.TrimSpace(rule.Regex) != "" {
+		rule.MatchingType = MatchSubdomainRegex
+	} else {
+		matching, err := ParseMatchingType(string(rule.MatchingType))
+		if err != nil {
+			return err
+		}
+		rule.MatchingType = matching
 	}
-	rule.MatchingType = matching
 	*r = DomainRule(rule)
-	return nil
+	return r.CompileRegex()
 }
 
 // RecordSet maps a DNS record type name (A, AAAA, CNAME, ...) to its values.

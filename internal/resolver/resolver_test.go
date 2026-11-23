@@ -11,6 +11,21 @@ import (
 
 func intPtr(v int) *int { return &v }
 
+// regexRule builds a compiled subdomainRegex rule, the way loading a config
+// would. An uncompiled regex deliberately matches nothing.
+func regexRule(domain, regex string, maxDepth *int) config.DomainRule {
+	rule := config.DomainRule{
+		Domain:       domain,
+		MatchingType: config.MatchSubdomainRegex,
+		Regex:        regex,
+		MaxDepth:     maxDepth,
+	}
+	if err := rule.CompileRegex(); err != nil {
+		panic(err)
+	}
+	return rule
+}
+
 func TestRuleCoversName(t *testing.T) {
 	tests := []struct {
 		name string
@@ -65,6 +80,37 @@ func TestRuleCoversName(t *testing.T) {
 				"example.com":     false,
 				"www.example.com": true,
 				"a.b.example.com": false,
+			},
+		},
+		{
+			name: "subdomain regex",
+			rule: regexRule("example.com", `^cdn-`, nil),
+			want: map[string]bool{
+				"example.com":         false,
+				"cdn-1.example.com":   true,
+				"a.cdn-1.example.com": false,
+				"cdn-1.example.org":   false,
+				"www.example.com":     false,
+			},
+		},
+		{
+			name: "subdomain regex matches any label of the prefix",
+			rule: regexRule("akamaized.net", `-rockstargames-com$`, nil),
+			want: map[string]bool{
+				"akamaized.net":                        false,
+				"e1-rockstargames-com.akamaized.net":   true,
+				"a.e1-rockstargames-com.akamaized.net": true,
+				"e1-rockstargames-com.akamaized.org":   false,
+				"prod.akamaized.net":                   false,
+			},
+		},
+		{
+			name: "subdomain regex with maxDepth",
+			rule: regexRule("akamaized.net", `-rockstargames-com$`, intPtr(1)),
+			want: map[string]bool{
+				"akamaized.net":                        false,
+				"e1-rockstargames-com.akamaized.net":   true,
+				"a.e1-rockstargames-com.akamaized.net": false,
 			},
 		},
 		{
@@ -386,6 +432,24 @@ func benchmarkRules(n int) []config.DomainRule {
 	return rules
 }
 
+// A regex rule is only reached by names under its own domain, so adding rules
+// elsewhere must not cost anything — and a name the regex rejects pays for one
+// regex run, not one per rule.
+func BenchmarkMatchDomainSubdomainRegex(b *testing.B) {
+	for _, n := range []int{10, 1000} {
+		rules := append(benchmarkRules(n), regexRule("akamaized.net", `-rockstargames-com$`, intPtr(1)))
+		res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
+		for _, qname := range []string{"e1-rockstargames-com.akamaized.net.", "prod.akamaized.net.", "www.unrelated.example.org."} {
+			b.Run(fmt.Sprintf("rules=%d/%s", n, qname), func(b *testing.B) {
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					res.matchDomain(qname)
+				}
+			})
+		}
+	}
+}
+
 // The exact hit is the common case and must not depend on list length.
 func BenchmarkMatchDomainExact(b *testing.B) {
 	for _, n := range []int{10, 1000} {
@@ -409,5 +473,91 @@ func BenchmarkMatchDomainSubdomain(b *testing.B) {
 				res.matchDomain("www.catchall.example.")
 			}
 		})
+	}
+}
+
+// The regex rule must win for the names it names and stay out of the way for
+// everything else, including the domain it is anchored at.
+func TestMatchDomainSubdomainRegex(t *testing.T) {
+	rules := []config.DomainRule{
+		regexRule("akamaized.net", `-rockstargames-com$`, intPtr(1)),
+		{Domain: "akamaized.net", MatchingType: config.MatchWithSubdomains, ListName: "all"},
+	}
+	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
+
+	for name, want := range map[string]string{
+		"e1-rockstargames-com.akamaized.net.":   "",
+		"a.e1-rockstargames-com.akamaized.net.": "all",
+		"prod.akamaized.net.":                   "all",
+		"akamaized.net.":                        "all",
+	} {
+		match, rule, _ := res.matchDomain(name)
+		if !match {
+			t.Errorf("%s: expected a match", name)
+			continue
+		}
+		if rule.ListName != want {
+			t.Errorf("%s: picked list %q, want %q", name, rule.ListName, want)
+		}
+	}
+}
+
+// Matching walks the query name's parents, so a rule anchored at another domain
+// is never visited and its regex never runs.
+func TestMatchDomainVisitsOnlyParentDomains(t *testing.T) {
+	// `^` matches every prefix, so this rule would swallow any name it is
+	// offered. It must never be offered a name outside other.net.
+	rules := []config.DomainRule{
+		regexRule("other.net", `^`, nil),
+		regexRule("akamaized.net", `-rockstargames-com$`, nil),
+	}
+	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
+
+	for domain, want := range map[string]int{"other.net": 1, "akamaized.net": 1} {
+		if got := len(res.subdomainRules[domain]); got != want {
+			t.Errorf("subdomainRules[%q] holds %d rules, want %d", domain, got, want)
+		}
+	}
+	for _, name := range []string{"www.example.com.", "akamaized.net.", "prod.akamaized.net."} {
+		if match, _, _ := res.matchDomain(name); match {
+			t.Errorf("%s matched, but no rule covers it", name)
+		}
+	}
+	if match, _, _ := res.matchDomain("anything.other.net."); !match {
+		t.Error("other.net rule should still cover its own subdomains")
+	}
+}
+
+// The index must not reorder rules: the first covering rule in config order wins
+// even when a later rule is anchored at a more specific parent.
+func TestMatchDomainKeepsConfigOrderAcrossParents(t *testing.T) {
+	rules := []config.DomainRule{
+		{Domain: "example.com", MatchingType: config.MatchWithSubdomains, ListName: "broad"},
+		{Domain: "cdn.example.com", MatchingType: config.MatchWithSubdomains, ListName: "narrow"},
+	}
+	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
+	if _, rule, _ := res.matchDomain("a.cdn.example.com."); rule.ListName != "broad" {
+		t.Errorf("picked %q, want the rule declared first", rule.ListName)
+	}
+
+	rules[0], rules[1] = rules[1], rules[0]
+	res = New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
+	if _, rule, _ := res.matchDomain("a.cdn.example.com."); rule.ListName != "narrow" {
+		t.Errorf("picked %q, want the rule declared first", rule.ListName)
+	}
+}
+
+// A name the narrower rule rejects still falls through to a broader rule below.
+func TestMatchDomainFallsThroughRejectedRegex(t *testing.T) {
+	rules := []config.DomainRule{
+		regexRule("example.com", `^cdn-`, nil),
+		{Domain: "example.com", MatchingType: config.MatchWithSubdomains, ListName: "broad"},
+	}
+	res := New(nil, nil, rules, nil, nil, nil, nil, 0, 0, 0, false, nil, -1, 0)
+	if _, rule, _ := res.matchDomain("www.example.com."); rule.ListName != "broad" {
+		t.Errorf("picked %q, want broad", rule.ListName)
+	}
+	if _, rule, _ := res.matchDomain("cdn-1.example.com."); rule.ListName != "" {
+		t.Errorf("picked %q, want the regex rule", rule.ListName)
 	}
 }
